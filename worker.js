@@ -9,8 +9,8 @@
 //
 // Binding KV (namespace binding name: CFG):
 //   CFG / CFG               configuração das carteiras
-//   CFG / estado4           fila, cursores, deduplicação e resumo do dia
-//   CFG / topicos           tópicos por partida
+//   CFG / estado4           fila, cursores, deduplicação, resumo do dia, eventos
+//   CFG / topicos           tópicos por partida (chave = slug do evento)
 //   CFG / lock              trava de execução (best effort)
 //   CFG / topico_atualizacoes  ID do tópico "Atualizações"
 //
@@ -23,6 +23,12 @@
 //
 // O processamento usa paginação persistente: se houver mais páginas, o cursor é
 // retomado no próximo ciclo. Falhas de envio não apagam apostas da fila.
+//
+// 2026-10-28-lista-v2:
+//   - enviarGrupo real (tópico por partida, compartilhado entre carteiras)
+//   - mapping persistente cond -> slug do tópico em estado.eventos
+//   - retry/aguardando metadados da Gamma antes de criar tópico
+//   - recriação automática se o tópico for apagado manualmente
 
 const DATA_API = "https://data-api.polymarket.com";
 const GAMMA_API = "https://gamma-api.polymarket.com";
@@ -34,13 +40,13 @@ const KV_ESTADO_ANTIGO = "estado3";
 const KV_TOPICOS = "topicos";
 const KV_LOCK = "lock";
 
-const VERSAO = "2026-10-28-lista-v1";
+const VERSAO = "2026-10-28-lista-v2";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
-// Recogniza slugs comuns sem confundir siglas curtas como "val" ou "rl" com texto comum.
-const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?of[-_\s]?kings|hok|king[-_\s]?of[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
+// Reconhece slugs comuns sem confundir siglas curtas como "val" ou "rl" com texto comum.
+const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
 
-// Limites de trabalho por ciclo: continuam em ciclos seguintes, sem descartar histórico.
+// Limites de trabalho por ciclo.
 const CARTEIRAS_POR_CICLO = 20;
 const PAGINAS_POR_CARTEIRA_CICLO = 1;
 const LIMITE_PAGINA = 500;
@@ -53,6 +59,8 @@ const MAX_AVISOS = 6;
 const LOCK_MS = 55000;
 const DIAS_TOPICO = 30;
 const TIMEOUT_FETCH_MS = 10000;
+const TENTATIVAS_METADADOS = 3;      // tentativas antes de criar tópico sem metadados
+const RETRY_METADADOS_S = 30;        // backoff específico para "aguardando metadados"
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -161,21 +169,17 @@ function normalizar(t) {
   };
 }
 function chaveTrade(n) {
-  // A API não fornece um ID de fill universal; a combinação abaixo reduz colisões
-  // entre fills na mesma transação e também funciona quando o hash está ausente.
   return [
     n.tx || "sem-tx", n.asset || "sem-asset", n.cond, n.idx, n.side, n.ts,
     n.size.toFixed(6), n.price.toFixed(6), chaveTexto(n.outcome),
   ].join("|");
 }
 function chaveTradeAntiga(n) {
-  // Formato usado na versão anterior: permite migrar a deduplicação sem reenviar apostas recentes.
   return [n.tx, n.cond, n.idx, n.side, n.size.toFixed(4), n.price.toFixed(4)].join("|");
 }
 function eEsports(n) {
   const slugTexto = `${n.eventSlug || ""} ${n.slug || ""}`;
   if (ESPORT.test(slugTexto)) return true;
-  // Alguns slugs de mercados omitem o nome do jogo; use sinais específicos de e-sports.
   const t = `${n.titulo || ""} ${n.slug || ""}`.replace(/[-_]+/g, " ");
   return /\b(?:map\s*#?\s*\d{1,2}|mapa\s*#?\s*\d{1,2}|total\s+(?:de\s+)?maps?|maps?\s+(?:over|under)|map\s+handicap|mapas?\s+handicap|first\s+blood|total\s+rounds?|kills?|bo[1-7])\b/i.test(t);
 }
@@ -209,7 +213,6 @@ async function fetchDados(url, init = {}) {
   for (let tentativa = 0; tentativa < 2; tentativa++) {
     try {
       const r = await fetchComTimeout(url, init);
-      // Não repetir 429 de imediato; o cursor fica salvo para a próxima execução.
       if (r.status === 429) return r;
       if (r.status >= 500 && tentativa === 0) {
         await pausa(350);
@@ -255,11 +258,11 @@ function extrairTimes(texto) {
   const b = limparTime(depoisDoVs);
   if (!a || !b || a.length > 50 || b.length > 50) return null;
   if (NAO_TIME.test(chaveTexto(a)) || NAO_TIME.test(chaveTexto(b))) return null;
-  if (JOGO.test(chaveTexto(a)) || JOGO.test(chaveTexto(b))) return null;
+  if (JOGO.test(chaaveTexto(a)) || JOGO.test(chaveTexto(b))) return null;
   return { a, b };
-}
+ =}
 
-const alvoMercado = n => `${n.titulo || ""} ${String(n.slug || "").replace(/[-_]+/g, " ")}`
+const alvoMerc numeroado = n => `${n.titulo || ""Map} ${String(n.slug ||a "").replace(/[-_]+De/g, " ")}`
   .replace(/\s+/g, " ").trim();
 const RE_TOTAL_MAPAS = /\btotal\s*(?:(?:de|of)\s*)?(?:maps?|mapas)\b|\b(?:maps?|mapas)\s*(?:totais?|total|over|under|o\s*\/\s*u)\b|\b(?:over\s*\/\s*under|o\s*\/\s*u|over|under)\s*(?:\d+(?:[.,]\d+)?)?\s*(?:(?:de|of)\s*)?(?:maps?|mapas)\b|\b(?:number\s+of\s+maps|maps?\s+played)\b/i;
 
@@ -270,7 +273,7 @@ function numeroMapaDe(texto) {
 function classificarMercado(n) {
   const alvo = alvoMercado(n);
   const limpo = alvo.replace(/(\d)pt(\d)/gi, "$1.$2");
-  const numMapa = numeroMapaDe(limpo);
+  const numMap(limpo);
 
   if (RE_TOTAL_MAPAS.test(limpo)) return { tipo: "total_mapas", rotulo: "Total de mapas" };
   if (/\b(handicap|spread)\b/i.test(limpo)) {
@@ -291,12 +294,10 @@ function classificarMercado(n) {
   if (temTimes || /\b(match\s+winner|winner\s+of\s+(?:the\s+)?match|match\s+result|moneyline|series\s+winner|who\s+will\s+win|win\s+(?:the\s+)?match|vencedor\s+da\s+partida)\b/i.test(limpo)) {
     return { tipo: "vencedor", rotulo: "Vencedor da partida" };
   }
-  // Não chamar mercados desconhecidos de "Vencedor": preserva o nome verdadeiro.
   return { tipo: "outro", rotulo: truncar(n.titulo || n.slug || "Mercado não classificado", 65) };
 }
 
 function linhaTotal(n) {
-  // Remova a data no slug ANTES de substituir hífens; assim 2026-10-23 nunca vira a linha "10".
   let limpo = `${n.titulo || ""} ${String(n.slug || "").replace(/\d{4}-\d{2}-\d{2}/g, " ")}`;
   limpo = limpo.replace(/[-_]+/g, " ").replace(/(\d)pt(\d)/gi, "$1.$2");
   limpo = limpo.replace(/\bbo\s*\d+\b/gi, " ");
@@ -365,7 +366,7 @@ function extrairEvento(ev, cond) {
 }
 
 // -----------------------------------------------------------------------------
-// Telegram helpers (mantidos do original)
+// Telegram helpers
 // -----------------------------------------------------------------------------
 async function enviarComRetentativa(env, metodo, corpo, tentativas = 3) {
   let ultima;
@@ -465,7 +466,6 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
     message_thread_id: topicoId,
   };
 
-  // Tenta editar a mensagem existente
   if (estado.lista.msgId) {
     const edit = await enviarComRetentativa(env, "editMessageText", {
       ...corpo,
@@ -479,7 +479,6 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
       return true;
     }
 
-    // Se a mensagem sumiu, cria uma nova
     if (/message to edit not found|message_id_invalid|can't be edited/i.test(edit.desc || "")) {
       estado.lista.msgId = null;
     } else {
@@ -488,7 +487,6 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
     }
   }
 
-  // Envia nova mensagem
   const novo = await enviarComRetentativa(env, "sendMessage", corpo);
   if (novo.ok && novo.result) {
     estado.lista.msgId = novo.result.message_id;
@@ -503,7 +501,7 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
 }
 
 // -----------------------------------------------------------------------------
-// Resumo diário (mantido do original + pequenas melhorias de robustez)
+// Resumo diário
 // -----------------------------------------------------------------------------
 function registrarAposta(estado, g) {
   const dia = diaBR(Date.now());
@@ -649,7 +647,7 @@ async function lerEstado(env) {
   if (raw) {
     try { e = JSON.parse(raw); } catch (_) { throw new Error("estado4 corrompido; interrompi para não sobrescrever a fila"); }
   } else {
-    e = { pendentes: await migrarFilaAntiga(env), vistos: {}, ultimo: {}, coletas: {}, resumo: null, lista: null, indiceCarteira: 0 };
+    e = { pendentes: await migrarFilaAntiga(env), vistos: {}, ultimo: {}, coletas: {}, resumo: null, lista: null, eventos: {}, indiceCarteira: 0 };
   }
   e.pendentes = Array.isArray(e.pendentes) ? e.pendentes.filter(it => it && it.n && it.w) : [];
   e.vistos = e.vistos && typeof e.vistos === "object" ? e.vistos : {};
@@ -657,6 +655,7 @@ async function lerEstado(env) {
   e.coletas = e.coletas && typeof e.coletas === "object" ? e.coletas : {};
   e.resumo = e.resumo && typeof e.resumo === "object" ? e.resumo : null;
   e.lista = e.lista && typeof e.lista === "object" ? e.lista : null;
+  e.eventos = e.eventos && typeof e.eventos === "object" && !Array.isArray(e.eventos) ? e.eventos : {};
   e.indiceCarteira = Number.isInteger(e.indiceCarteira) && e.indiceCarteira >= 0 ? e.indiceCarteira : 0;
   return e;
 }
@@ -790,9 +789,8 @@ async function coletar(cfg, estado) {
 }
 
 // -----------------------------------------------------------------------------
-// Carteira removida: as apostas dela ainda na fila deixam de ser enviadas e o cursor
-// de coleta é descartado. "vistos" e "ultimo" ficam, para não reenviar apostas antigas
-// se a carteira voltar a ser adicionada.
+// Carteira removida
+// -----------------------------------------------------------------------------
 function podarCarteirasRemovidas(estado, cfg) {
   const ativas = new Set(cfg.carteiras.map(c => c.w));
   const antes = estado.pendentes.length;
@@ -801,7 +799,6 @@ function podarCarteirasRemovidas(estado, cfg) {
   return antes - estado.pendentes.length;
 }
 
-// Nome ou lista mudou: o resumo do dia é refeito no próximo ciclo, sem esperar nova aposta.
 function sincronizarResumo(estado, cfg) {
   const r = estado.resumo;
   if (!r || r.dia !== diaBR(Date.now()) || !r.apostas) return;
@@ -815,14 +812,125 @@ function sincronizarResumo(estado, cfg) {
 }
 
 // -----------------------------------------------------------------------------
-// Agrupamento e envio de apostas (simplificado – mantém a lógica original)
+// Busca de metadados do evento (Gamma)
+// -----------------------------------------------------------------------------
+async function buscarEvento(env, n, cacheEventos) {
+  const chaveCache = n.eventSlug || `cond:${n.cond}`;
+  if (cacheEventos.has(chaveCache)) return cacheEventos.get(chaveCache);
+
+  const tentar = async () => {
+    let ev = null;
+    try {
+      // 1ª tentativa: pelo slug do evento (mais confiável, inclui times)
+      if (n.eventSlug) {
+        const u = new URL(`${GAMMA_API}/events`);
+        u.searchParams.set("slug", n.eventSlug);
+        const r = await fetchComTimeout(u.toString(), { headers: { Accept: "application/json" } });
+        if (r.ok) {
+          const lista = await r.json();
+          const arr = Array.isArray(lista) ? lista : (lista && Array.isArray(lista.data) ? lista.data : []);
+          if (arr.length) ev = extrairEvento(arr[0], n.cond);
+        }
+      }
+      // 2ª tentativa: pelo condition_id do mercado
+      if (!ev) {
+        const u = new URL(`${GAMMA_API}/markets`);
+        u.searchParams.set("condition_ids", n.cond);
+        const r = await fetchComTimeout(u.toString(), { headers: { Accept: "application/json" } });
+        if (r.ok) {
+          const lista = await r.json();
+          const arr = Array.isArray(lista) ? lista : (lista && Array.isArray(lista.data) ? lista.data : []);
+          const m = arr[0];
+          if (m) {
+            const pai = (Array.isArray(m.events) && m.events[0]) || m.event
+              || { markets: [m], title: m.question, slug: m.slug };
+            ev = extrairEvento(pai, n.cond);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("buscarEvento: " + limpar(env, e).slice(0, 120));
+    }
+    return ev;
+  };
+
+  let ev = await tentar();
+  if (!ev) {
+    await pausa(400);
+    ev = await tentar();
+  }
+
+  cacheEventos.set(chaveCache, ev);
+  return ev;
+}
+
+// -----------------------------------------------------------------------------
+// Nome do tópico por partida
+// -----------------------------------------------------------------------------
+function nomeTopicoPartida(ev, n) {
+  const times = (ev && ev.times) || extrairTimes(n && n.titulo);
+  let base;
+  if (times) base = `${times.a} vs ${times.b}`;
+  else if (ev && ev.titulo) base = ev.titulo;
+  else if (n && n.titulo) base = n.titulo;
+  else base = "Partida";
+
+  const ms = ev && ev.inicioMs;
+  if (ms > 0) {
+    const hora = horaBR(ms);
+    const hoje = diaBR(ms) === diaBR(Date.now());
+    base += hoje ? ` · ${hora}` : ` · ${diaCurtoBR(ms)} ${hora}`;
+  } else if (ev && ev.data) {
+    base += ` · ${diaComAnoBR(ev.data)}`;
+  }
+  return truncar(base, 128);
+}
+
+// -----------------------------------------------------------------------------
+// Corpo da mensagem
+// -----------------------------------------------------------------------------
+function textoGrupo(env, g, cfg, ev) {
+  const nome = nomeCarteira(cfg, g.w);
+  const n0 = g.itens[0] && g.itens[0].n;
+  const titulo = ev && ev.times
+    ? `${ev.times.a} vs ${ev.times.b}`
+    : (ev && ev.titulo) || (n0 && n0.titulo) || "Partida";
+
+  const quando = ev && ev.inicioMs
+    ? `🕒 ${diaCurtoBR(ev.inicioMs)} · ${horaBR(ev.inicioMs)}`
+    : ev && ev.data
+    ? `📅 ${diaComAnoBR(ev.data)}`
+    : "";
+
+  const corpo = g.itens.map(it => {
+    const d = descreverAposta(it.n);
+    const valor = Number(it.n.size || 0) * Number(it.n.price || 0);
+    return (
+      `<b>${esc(d.classificacao.rotulo)}</b>\n` +
+      `→ ${esc(d.escolha)}\n` +
+      `<i>${moeda(valor)} · ${quantidade(it.n.size)} cotas @ ${numeroBR(it.n.price, 3)} · ${pct(it.n.price)}</i>`
+    );
+  }).join("\n\n");
+
+  return [
+    `🎯 <b>${esc(titulo)}</b>`,
+    quando,
+    ``,
+    `👤 <b>${esc(nome)}</b>`,
+    ``,
+    corpo,
+    ``,
+    `<i>${horaSegBR(Date.now())} · ${VERSAO}</i>`,
+  ].filter(x => x !== "").join("\n");
+}
+
+// -----------------------------------------------------------------------------
+// Agrupamento: uma mensagem por (carteira, condição). O tópico é resolvido depois,
+// por evento — então todas as carteiras caem no tópico da partida.
 // -----------------------------------------------------------------------------
 function agrupar(pendentes) {
-  // Mantém a lógica original de agrupamento por carteira + partida
-  // (o código original de agrupar/enviarGrupo continua válido)
   const agora = Date.now();
   const prontos = pendentes.filter(it => !it.nextTryAt || it.nextTryAt <= agora);
-  // Agrupa por carteira + condition_id para não spammar
   const grupos = new Map();
   for (const it of prontos) {
     const chave = `${it.w}|${it.n.cond}`;
@@ -832,15 +940,110 @@ function agrupar(pendentes) {
   return [...grupos.values()];
 }
 
-async function enviarGrupo(env, g, cfg, topicos, cacheEventos) {
-  // Esta função deve ser a mesma do seu código original.
-  // Como estava truncada no paste, mantive a chamada.
-  // Se precisar, cole aqui a versão completa de enviarGrupo do seu código antigo.
-  // Por enquanto deixo um stub seguro que não quebra o ciclo.
-  console.warn("enviarGrupo: usando versão simplificada – substitua pela original se necessário");
-  return { ok: false, desc: "enviarGrupo precisa da implementação original" };
+// -----------------------------------------------------------------------------
+// Envio ao Telegram: tópico por partida (compartilhado entre carteiras)
+// -----------------------------------------------------------------------------
+async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
+  if (!g || !g.itens || !g.itens.length) {
+    return { ok: false, desc: "grupo vazio" };
+  }
+
+  const n = g.itens[0].n;
+  const ev = await buscarEvento(env, n, cacheEventos);
+  const tent = Math.max(...g.itens.map(it => Number(it.tent || 0)));
+
+  // Sem metadados: aguarda para não criar tópico com nome errado.
+  if (!ev && tent < TENTATIVAS_METADADOS) {
+    return {
+      ok: false,
+      status: 0,
+      desc: `aguardando metadados do evento (Gamma) [${tent + 1}/${TENTATIVAS_METADADOS}]`,
+      retryAfter: RETRY_METADADOS_S,
+    };
+  }
+
+  // 1. Determinar chave canônica do tópico.
+  //    Prioridade: mapping persistido (estável) > slug do evento > eventSlug > cond.
+  let chaveEv = null;
+  if (estado && estado.eventos) {
+    const persistido = estado.eventos[n.cond];
+    if (persistido && topicos[persistido]) chaveEv = persistido;
+  }
+  if (!chaveEv) {
+    chaveEv = (ev && ev.slug) || n.eventSlug || n.cond;
+  }
+
+  // 2. Obter ou criar tópico compartilhado
+  let topico = topicos[chaveEv];
+  if (!topico || !(topico.id > 0)) {
+    const nome = nomeTopicoPartida(ev, n);
+    const r = await enviarComRetentativa(env, "createForumTopic", {
+      chat_id: env.TELEGRAM_CHAT_ID,
+      name: nome,
+    });
+    if (!r.ok || !r.result || !r.result.message_thread_id) {
+      return {
+        ok: false,
+        status: r.status || 0,
+        desc: "falha ao criar tópico da partida: " + (r.desc || ""),
+      };
+    }
+    topico = {
+      id: r.result.message_thread_id,
+      nome,
+      inicioMs: (ev && ev.inicioMs) || 0,
+      dia: (ev && ev.data) || diaBR(Date.now()),
+    };
+    topicos[chaveEv] = topico;
+  }
+
+  // 3. Persistir mapping cond -> slug do tópico
+  if (estado) {
+    if (!estado.eventos) estado.eventos = {};
+    estado.eventos[n.cond] = chaveEv;
+  }
+
+  // 4. Enviar mensagem
+  const corpo = {
+    chat_id: env.TELEGRAM_CHAT_ID,
+    message_thread_id: topico.id,
+    text: textoGrupo(env, g, cfg, ev),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+
+  let r = await enviarComRetentativa(env, "sendMessage", corpo);
+
+  // Tópico apagado manualmente → recria e tenta de novo uma vez
+  if (!r.ok && r.status === 400 && /thread|topic|TOPIC_ID_INVALID|TOPIC_DELETED/i.test(r.desc || "")) {
+    delete topicos[chaveEv];
+    const nome = nomeTopicoPartida(ev, n);
+    const rec = await enviarComRetentativa(env, "createForumTopic", {
+      chat_id: env.TELEGRAM_CHAT_ID,
+      name: nome,
+    });
+    if (rec.ok && rec.result && rec.result.message_thread_id) {
+      topico = {
+        id: rec.result.message_thread_id,
+        nome,
+        inicioMs: (ev && ev.inicioMs) || 0,
+        dia: (ev && ev.data) || diaBR(Date.now()),
+      };
+      topicos[chaveEv] = topico;
+      r = await enviarComRetentativa(env, "sendMessage", { ...corpo, message_thread_id: topico.id });
+    }
+  }
+
+  if (r.ok && r.result) return { ok: true, result: r.result, topicoId: topico.id };
+  return {
+    ok: false,
+    status: r.status || 0,
+    desc: r.desc || `HTTP ${r.status}`,
+    retryAfter: r.status === 429 ? 5 : 0,
+  };
 }
 
+// -----------------------------------------------------------------------------
 // Ciclo principal
 // -----------------------------------------------------------------------------
 async function ciclo(env, origem) {
@@ -862,7 +1065,6 @@ async function ciclo(env, origem) {
     podarCarteirasRemovidas(estado, cfg);
     sincronizarResumo(estado, cfg);
 
-    // Nova funcionalidade: atualiza a lista de carteiras
     await atualizarListaCarteiras(env, estado, cfg);
 
     topicos = await lerTopicos(env);
@@ -882,7 +1084,7 @@ async function ciclo(env, origem) {
     const enviados = new Set();
     for (const g of agrupar(estado.pendentes).slice(0, MAX_AVISOS)) {
       try {
-        const r = await enviarGrupo(env, g, cfg, topicos, cacheEventos);
+        const r = await enviarGrupo(env, g, cfg, topicos, cacheEventos, estado);
         if (r.ok) {
           for (const it of g.itens) enviados.add(it.id);
           registrarAposta(estado, g);
@@ -915,6 +1117,14 @@ async function ciclo(env, origem) {
     resultado.erros.push(truncar(limpar(env, e), 300));
   } finally {
     try {
+      // Limpa mappings órfãos (tópicos podados por idade ou inexistentes)
+      if (estado && estado.eventos && topicos) {
+        const limite = diaBR(Date.now() - DIAS_TOPICO * 86400000);
+        for (const cond of Object.keys(estado.eventos)) {
+          const t = topicos[estado.eventos[cond]];
+          if (!t || (t.dia && t.dia < limite)) delete estado.eventos[cond];
+        }
+      }
       if (estado) await salvarEstado(env, estado);
       if (topicos) await salvarTopicos(env, topicos);
     } catch (e) {
@@ -973,7 +1183,6 @@ export default {
     try {
       if (path === "/config") {
         const salvos = await salvarCarteirasPayload(env, body);
-        // Força atualização da lista de carteiras
         try {
           const estado = await lerEstado(env);
           const cfg = await lerConfig(env);
@@ -985,11 +1194,9 @@ export default {
         return jsonResp({ ok: true, ...salvos, versao: VERSAO });
       }
 
-      // /notify
       const out = { ok: true, versao: VERSAO };
       if (body && Array.isArray(body.carteiras)) {
         Object.assign(out, await salvarCarteirasPayload(env, body));
-        // Força atualização da lista
         try {
           const estado = await lerEstado(env);
           const cfg = await lerConfig(env);
