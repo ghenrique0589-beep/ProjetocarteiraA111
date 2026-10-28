@@ -16,19 +16,8 @@
 //
 // GET /config: (Authorization: Bearer CHAVE) devolve { carteiras, atualizado }
 // POST /config: { "carteiras": [{ "w": "0x...", "nome": "Minha carteira" }], "base": "<atualizado lido antes>" }
-//   base é opcional. Se a lista tiver mudado em outro aparelho desde essa leitura,
-//   responde 409 com a lista atual, sem sobrescrever nada.
 // POST /notify: payload opcional igual ao /config; salva e executa um ciclo agora
 // GET /: health check básico (mostra a versão)
-//
-// O processamento usa paginação persistente: se houver mais páginas, o cursor é
-// retomado no próximo ciclo. Falhas de envio não apagam apostas da fila.
-//
-// 2026-10-28-lista-v2:
-//   - enviarGrupo real (tópico por partida, compartilhado entre carteiras)
-//   - mapping persistente cond -> slug do tópico em estado.eventos
-//   - retry/aguardando metadados da Gamma antes de criar tópico
-//   - recriação automática se o tópico for apagado manualmente
 
 const DATA_API = "https://data-api.polymarket.com";
 const GAMMA_API = "https://gamma-api.polymarket.com";
@@ -43,10 +32,8 @@ const KV_LOCK = "lock";
 const VERSAO = "2026-10-28-lista-v2";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
-// Reconhece slugs comuns sem confundir siglas curtas como "val" ou "rl" com texto comum.
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
 
-// Limites de trabalho por ciclo.
 const CARTEIRAS_POR_CICLO = 20;
 const PAGINAS_POR_CARTEIRA_CICLO = 1;
 const LIMITE_PAGINA = 500;
@@ -59,8 +46,8 @@ const MAX_AVISOS = 6;
 const LOCK_MS = 55000;
 const DIAS_TOPICO = 30;
 const TIMEOUT_FETCH_MS = 10000;
-const TENTATIVAS_METADADOS = 3;      // tentativas antes de criar tópico sem metadados
-const RETRY_METADADOS_S = 30;        // backoff específico para "aguardando metadados"
+const TENTATIVAS_METADADOS = 3;
+const RETRY_METADADOS_S = 30;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -68,6 +55,7 @@ const CORS = {
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Access-Control-Max-Age": "86400",
 };
+
 const jsonResp = (dados, status = 200) => new Response(JSON.stringify(dados), {
   status,
   headers: { ...CORS, "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
@@ -77,15 +65,11 @@ const textResp = (texto, status = 200) => new Response(texto, {
   headers: { ...CORS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
 });
 
-// -----------------------------------------------------------------------------
-// Utilitários
-// -----------------------------------------------------------------------------
 const esc = v => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const truncar = (v, n) => { const s = String(v ?? ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
 const agoraS = () => Math.floor(Date.now() / 1000);
-const chaveTexto = v => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-  .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const chaveTexto = v => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const limpar = (env, e) => {
   let s = String(e && e.message ? e.message : e);
   for (const v of [env && env.TELEGRAM_BOT_TOKEN, env && env.CHAVE]) if (v) s = s.split(v).join("***");
@@ -98,17 +82,12 @@ const moeda = v => "US$ " + numeroBR(v, 2);
 const pct = p => numeroBR(Number(p || 0) * 100, 1) + "%";
 const quantidade = v => numeroBR(v, 3);
 
-const fmtHora = new Intl.DateTimeFormat("pt-BR", {
-  timeZone: FUSO, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-});
-const fmtHoraSeg = new Intl.DateTimeFormat("pt-BR", {
-  timeZone: FUSO, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
-});
-const fmtDiaPartes = new Intl.DateTimeFormat("en-CA", {
-  timeZone: FUSO, year: "numeric", month: "2-digit", day: "2-digit",
-});
+const fmtHora = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+const fmtHoraSeg = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+const fmtDiaPartes = new Intl.DateTimeFormat("en-CA", { timeZone: FUSO, year: "numeric", month: "2-digit", day: "2-digit" });
 const horaBR = ms => fmtHora.format(new Date(ms));
 const horaSegBR = ms => fmtHoraSeg.format(new Date(ms));
+
 function diaBR(ms) {
   const p = Object.fromEntries(fmtDiaPartes.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
   return `${p.year}-${p.month}-${p.day}`;
@@ -119,7 +98,6 @@ const diaComAnoBR = iso => {
   return y && m && d ? `${d}/${m}/${y}` : "data não identificada";
 };
 
-// Aceita segundos, milissegundos, datas ISO e "2026-10-23 19:30:00+00".
 function paraMs(v) {
   if (v === null || v === undefined || v === "") return 0;
   if (typeof v === "number") return Number.isFinite(v) ? (v > 1e12 ? v : v * 1000) : 0;
@@ -140,14 +118,10 @@ function dataValor(v) {
   return ms ? diaBR(ms) : null;
 }
 function paraMsHorario(v) {
-  // Uma data sem horário não deve ser exibida falsamente como início à meia-noite.
   if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v.trim())) return 0;
   return paraMs(v);
 }
 
-// -----------------------------------------------------------------------------
-// Data API: normalização, filtro e identidade de cada execução
-// -----------------------------------------------------------------------------
 function normalizar(t) {
   if (!t || typeof t !== "object") return null;
   const size = Number(t.size);
@@ -196,9 +170,6 @@ function montarUrlTrades(w, start, end, cursor) {
   return u.toString();
 }
 
-// -----------------------------------------------------------------------------
-// Rede e retentativas
-// -----------------------------------------------------------------------------
 async function fetchComTimeout(url, init = {}, timeoutMs = TIMEOUT_FETCH_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("tempo limite da requisição"), timeoutMs);
@@ -238,32 +209,25 @@ async function mapLimit(itens, limite, fn) {
   await Promise.all(workers);
 }
 
-// -----------------------------------------------------------------------------
-// Times e classificação de mercados
-// -----------------------------------------------------------------------------
 const NAO_TIME = /^(yes|no|over|under|sim|nao|map|mapa|game|total|winner|handicap)$/i;
 const JOGO = /^(counter strike.*|cs2?|csgo|dota.*|league of legends|lol|valorant|rocket league|rainbow six.*|r6.*|call of duty|cod|overwatch.*|starcraft.*|mobile legends|mlbb|esports?)$/i;
-const limparTime = v => String(v || "").replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ")
-  .replace(/^[\s:|–—-]+|[\s:|–—-]+$/g, "").trim();
+const limparTime = v => String(v || "").replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").replace(/^[\s:|–—-]+|[\s:|–—-]+$/g, "").trim();
 
-// Ex.: "Counter-Strike: NAVI vs FaZe (BO3) - Map 1 Winner" -> NAVI / FaZe.
 function extrairTimes(texto) {
   const s = String(texto || "").replace(/\s+/g, " ").trim();
   const m = s.match(/^(.+?)\s+(?:vs\.?|versus)\s+(.+)$/i);
   if (!m) return null;
   const antesDoVs = m[1].replace(/^.*:\s*/, "");
-  const depoisDoVs = m[2].split(/\s+[-–—|]\s+/)[0]
-    .split(/\s+(?=(?:map|mapa|game|jogo|winner|total|handicap|over|under|moneyline|bo\s*\d)\b)/i)[0];
+  const depoisDoVs = m[2].split(/\s+[-–—|]\s+/)[0].split(/\s+(?=(?:map|mapa|game|jogo|winner|total|handicap|over|under|moneyline|bo\s*\d)\b)/i)[0];
   const a = limparTime(antesDoVs);
   const b = limparTime(depoisDoVs);
   if (!a || !b || a.length > 50 || b.length > 50) return null;
   if (NAO_TIME.test(chaveTexto(a)) || NAO_TIME.test(chaveTexto(b))) return null;
-  if (JOGO.test(chaaveTexto(a)) || JOGO.test(chaveTexto(b))) return null;
+  if (JOGO.test(chaveTexto(a)) || JOGO.test(chaveTexto(b))) return null;
   return { a, b };
- =}
+}
 
-const alvoMerc numeroado = n => `${n.titulo || ""Map} ${String(n.slug ||a "").replace(/[-_]+De/g, " ")}`
-  .replace(/\s+/g, " ").trim();
+const alvoMercado = n => `${n.titulo || ""} ${String(n.slug || "").replace(/[-_]+/g, " ")}`.replace(/\s+/g, " ").trim();
 const RE_TOTAL_MAPAS = /\btotal\s*(?:(?:de|of)\s*)?(?:maps?|mapas)\b|\b(?:maps?|mapas)\s*(?:totais?|total|over|under|o\s*\/\s*u)\b|\b(?:over\s*\/\s*under|o\s*\/\s*u|over|under)\s*(?:\d+(?:[.,]\d+)?)?\s*(?:(?:de|of)\s*)?(?:maps?|mapas)\b|\b(?:number\s+of\s+maps|maps?\s+played)\b/i;
 
 function numeroMapaDe(texto) {
@@ -273,7 +237,7 @@ function numeroMapaDe(texto) {
 function classificarMercado(n) {
   const alvo = alvoMercado(n);
   const limpo = alvo.replace(/(\d)pt(\d)/gi, "$1.$2");
-  const numMap(limpo);
+  const numMapa = numeroMapaDe(limpo);
 
   if (RE_TOTAL_MAPAS.test(limpo)) return { tipo: "total_mapas", rotulo: "Total de mapas" };
   if (/\b(handicap|spread)\b/i.test(limpo)) {
@@ -329,9 +293,6 @@ function descreverAposta(n) {
   return { classificacao: c, escolha, texto: `${c.rotulo} — ${escolha}` };
 }
 
-// -----------------------------------------------------------------------------
-// Metadados da partida (Gamma): times oficiais, data e horário inicial
-// -----------------------------------------------------------------------------
 function dataDoSlug(s) {
   const m = String(s || "").match(/(?:^|[^\d])(\d{4})-(\d{2})-(\d{2})(?:[^\d]|$)/);
   return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
@@ -365,9 +326,6 @@ function extrairEvento(ev, cond) {
   };
 }
 
-// -----------------------------------------------------------------------------
-// Telegram helpers
-// -----------------------------------------------------------------------------
 async function enviarComRetentativa(env, metodo, corpo, tentativas = 3) {
   let ultima;
   for (let i = 0; i < tentativas; i++) {
@@ -403,26 +361,20 @@ function nomeCarteira(cfg, w) {
   return (c && c.nome) || w.slice(0, 8) + "…";
 }
 
-// -----------------------------------------------------------------------------
-// Lista de carteiras monitoradas (tópico "Atualizações")
-// -----------------------------------------------------------------------------
 async function garantirTopicoAtualizacoes(env) {
   const raw = await env.CFG.get("topico_atualizacoes");
   if (raw) {
     const id = Number(raw);
     if (id > 0) return id;
   }
-
   const r = await enviarComRetentativa(env, "createForumTopic", {
     chat_id: env.TELEGRAM_CHAT_ID,
     name: NOME_TOPICO_ATUALIZACOES,
   });
-
   if (!r.ok || !r.result || !r.result.message_thread_id) {
     console.warn("falha ao criar tópico Atualizações: " + limpar(env, r.desc || r.status));
     return 0;
   }
-
   const id = r.result.message_thread_id;
   await env.CFG.put("topico_atualizacoes", String(id));
   return id;
@@ -432,53 +384,32 @@ function textoListaCarteiras(cfg) {
   if (!cfg.carteiras.length) {
     return `📋 <b>CARTEIRAS MONITORADAS</b> · 0\n\n<i>Nenhuma carteira no momento.</i>\n\n<code>${VERSAO}</code>`;
   }
-
   const linhas = cfg.carteiras.map((c, i) => {
     const nome = c.nome ? esc(c.nome) : "<i>sem nome</i>";
     return `<b>${String(i + 1).padStart(2, "0")}.</b> ${nome}\n<code>${c.w}</code>`;
   });
-
-  return `📋 <b>CARTEIRAS MONITORADAS</b> · ${cfg.carteiras.length}\n\n` +
-    linhas.join("\n\n") +
-    `\n\n<code>${VERSAO}</code> · atualizado ${horaSegBR(Date.now())}`;
+  return `📋 <b>CARTEIRAS MONITORADAS</b> · ${cfg.carteiras.length}\n\n` + linhas.join("\n\n") + `\n\n<code>${VERSAO}</code> · atualizado ${horaSegBR(Date.now())}`;
 }
 
 async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
   const hashAtual = cfg.carteiras.map(c => c.w + "|" + (c.nome || "")).join(",");
   const diaHoje = diaBR(Date.now());
-
   if (!estado.lista) estado.lista = { msgId: null, hash: "", dia: "", mudou: true };
-
   const mudouLista = estado.lista.hash !== hashAtual;
   const mudouDia = estado.lista.dia !== diaHoje;
-
   if (!forcar && !mudouLista && !mudouDia && !estado.lista.mudou) return false;
-
   const topicoId = await garantirTopicoAtualizacoes(env);
   if (!topicoId) return false;
-
   const texto = textoListaCarteiras(cfg);
   const corpo = {
-    chat_id: env.TELEGRAM_CHAT_ID,
-    text: texto,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    message_thread_id: topicoId,
+    chat_id: env.TELEGRAM_CHAT_ID, text: texto, parse_mode: "HTML",
+    disable_web_page_preview: true, message_thread_id: topicoId,
   };
-
   if (estado.lista.msgId) {
-    const edit = await enviarComRetentativa(env, "editMessageText", {
-      ...corpo,
-      message_id: estado.lista.msgId,
-    });
-
+    const edit = await enviarComRetentativa(env, "editMessageText", { ...corpo, message_id: estado.lista.msgId });
     if (edit.ok) {
-      estado.lista.hash = hashAtual;
-      estado.lista.dia = diaHoje;
-      estado.lista.mudou = false;
-      return true;
+      estado.lista.hash = hashAtual; estado.lista.dia = diaHoje; estado.lista.mudou = false; return true;
     }
-
     if (/message to edit not found|message_id_invalid|can't be edited/i.test(edit.desc || "")) {
       estado.lista.msgId = null;
     } else {
@@ -486,98 +417,56 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
       return false;
     }
   }
-
   const novo = await enviarComRetentativa(env, "sendMessage", corpo);
   if (novo.ok && novo.result) {
     estado.lista.msgId = novo.result.message_id;
-    estado.lista.hash = hashAtual;
-    estado.lista.dia = diaHoje;
-    estado.lista.mudou = false;
-    return true;
+    estado.lista.hash = hashAtual; estado.lista.dia = diaHoje; estado.lista.mudou = false; return true;
   }
-
   console.warn("lista carteiras (send): " + limpar(env, novo.desc).slice(0, 160));
   return false;
 }
 
-// -----------------------------------------------------------------------------
-// Resumo diário
-// -----------------------------------------------------------------------------
 function registrarAposta(estado, g) {
   const dia = diaBR(Date.now());
   if (!estado.resumo || estado.resumo.dia !== dia) {
     estado.resumo = { dia, apostas: {}, nomes: {}, msgId: null, mudou: true };
   }
   const r = estado.resumo;
-  for (const it of g.itens) {
-    const w = it.w;
-    r.apostas[w] = (r.apostas[w] || 0) + 1;
-  }
+  for (const it of g.itens) { r.apostas[it.w] = (r.apostas[it.w] || 0) + 1; }
   r.mudou = true;
 }
 
 async function atualizarResumo(env, estado, cfg) {
   const r = estado.resumo;
   if (!r || !r.mudou) return false;
-
-  const linhas = Object.keys(r.apostas || {})
-    .sort()
-    .map(w => {
-      const nome = (r.nomes && r.nomes[w]) || nomeCarteira(cfg, w);
-      return `${esc(nome.padEnd(12).slice(0, 12))} ${String(r.apostas[w]).padStart(4)}`;
-    });
-
+  const linhas = Object.keys(r.apostas || {}).sort().map(w => {
+    const nome = (r.nomes && r.nomes[w]) || nomeCarteira(cfg, w);
+    return `${esc(nome.padEnd(12).slice(0, 12))} ${String(r.apostas[w]).padStart(4)}`;
+  });
   const total = Object.values(r.apostas || {}).reduce((a, b) => a + b, 0);
-  const texto =
-    `📊 <b>RESUMO DIÁRIO · ${diaComAnoBR(r.dia)}</b>\n` +
-    `<pre>Carteira      Apostas\n` +
-    `${"─".repeat(20)}\n` +
-    (linhas.length ? linhas.join("\n") : "— nenhuma —") +
-    `\n${"─".repeat(20)}\n` +
-    `TOTAL${" ".repeat(9)}${String(total).padStart(4)}</pre>\n` +
-    `Contagem de execuções de aposta\nentregues pelo bot · Atualizado às ${horaBR(Date.now())}\n` +
-    `<code>${VERSAO}</code>`;
-
+  const texto = `📊 <b>RESUMO DIÁRIO · ${diaComAnoBR(r.dia)}</b>\n<pre>Carteira      Apostas\n${"─".repeat(20)}\n${linhas.length ? linhas.join("\n") : "— nenhuma —"}\n${"─".repeat(20)}\nTOTAL${" ".repeat(9)}${String(total).padStart(4)}</pre>\nContagem de execuções de aposta\nentregues pelo bot · Atualizado às ${horaBR(Date.now())}\n<code>${VERSAO}</code>`;
   const corpo = {
-    chat_id: env.TELEGRAM_CHAT_ID,
-    text: texto,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
+    chat_id: env.TELEGRAM_CHAT_ID, text: texto, parse_mode: "HTML", disable_web_page_preview: true,
   };
-
   if (r.msgId) {
     const e = await enviarComRetentativa(env, "editMessageText", { ...corpo, message_id: r.msgId });
-    if (e.ok || /not[ _]modified/i.test(e.desc || "")) {
-      r.mudou = false;
-      return true;
-    }
-    if (/not found|can't be edited|message_id_invalid|message to edit/i.test((e.desc || "").toLowerCase())) {
-      r.msgId = null;
-    } else {
+    if (e.ok || /not[ _]modified/i.test(e.desc || "")) { r.mudou = false; return true; }
+    if (/not found|can't be edited|message_id_invalid|message to edit/i.test((e.desc || "").toLowerCase())) { r.msgId = null; }
+    else {
       console.warn("resumo diário: " + limpar(env, e.desc).slice(0, 160));
       return false;
     }
   }
-
   const topicoResumo = Number(env.TELEGRAM_TOPICO_RESUMO) || 0;
-  let novo = await enviarComRetentativa(env, "sendMessage", topicoResumo
-    ? { ...corpo, message_thread_id: topicoResumo }
-    : corpo);
+  let novo = await enviarComRetentativa(env, "sendMessage", topicoResumo ? { ...corpo, message_thread_id: topicoResumo } : corpo);
   if (!novo.ok && topicoResumo && novo.status === 400 && /thread|topic/i.test(novo.desc || "")) {
     novo = await enviarComRetentativa(env, "sendMessage", corpo);
   }
-  if (novo.ok && novo.result) {
-    r.msgId = novo.result.message_id;
-    r.mudou = false;
-    return true;
-  }
+  if (novo.ok && novo.result) { r.msgId = novo.result.message_id; r.mudou = false; return true; }
   console.warn("resumo diário não atualizado: " + limpar(env, novo.desc).slice(0, 160));
   return false;
 }
 
-// -----------------------------------------------------------------------------
-// Configuração e persistência KV
-// -----------------------------------------------------------------------------
 async function lerConfig(env) {
   const raw = await env.CFG.get(KV_CFG);
   let v = {};
@@ -599,9 +488,7 @@ async function versaoAtual(env) {
   try { const v = JSON.parse(raw); return typeof v.atualizado === "string" ? v.atualizado : null; } catch (_) { return null; }
 }
 async function salvarCarteiras(env, carteiras, base) {
-  if (!Array.isArray(carteiras)) {
-    throw new Error('payload inválido: esperado { "carteiras": [{ "w": "0x...", "nome": "..." }] }');
-  }
+  if (!Array.isArray(carteiras)) { throw new Error('payload inválido: esperado { "carteiras": [{ "w": "0x...", "nome": "..." }] }'); }
   const vistos = new Set();
   const lista = [];
   let ignoradas = 0;
@@ -659,9 +546,7 @@ async function lerEstado(env) {
   e.indiceCarteira = Number.isInteger(e.indiceCarteira) && e.indiceCarteira >= 0 ? e.indiceCarteira : 0;
   return e;
 }
-async function salvarEstado(env, estado) {
-  await env.CFG.put(KV_ESTADO, JSON.stringify(estado));
-}
+async function salvarEstado(env, estado) { await env.CFG.put(KV_ESTADO, JSON.stringify(estado)); }
 async function lerTopicos(env) {
   const raw = await env.CFG.get(KV_TOPICOS);
   if (!raw) return {};
@@ -700,27 +585,18 @@ function selecionarCarteiras(carteiras, estado) {
   return selecionadas;
 }
 
-// -----------------------------------------------------------------------------
-// Coleta incremental com cursor persistente
-// -----------------------------------------------------------------------------
 async function coletarCarteira(c, estado) {
   const w = c.w;
   const agora = agoraS();
   const existentes = new Set(Array.isArray(estado.vistos[w]) ? estado.vistos[w] : []);
   const prefixoPendente = `${w}|`;
   for (const item of estado.pendentes) {
-    if (item && item.w === w && typeof item.id === "string" && item.id.startsWith(prefixoPendente)) {
-      existentes.add(item.id.slice(prefixoPendente.length));
-    }
+    if (item && item.w === w && typeof item.id === "string" && item.id.startsWith(prefixoPendente)) existentes.add(item.id.slice(prefixoPendente.length));
   }
   let job = estado.coletas[w];
   if (!job || typeof job !== "object") {
     const checkpoint = Number(estado.ultimo[w] || 0);
-    job = {
-      start: Math.max(1, checkpoint ? checkpoint - SOBREPOSICAO_S : agora - JANELA_INICIAL_S),
-      end: agora,
-      cursor: null,
-    };
+    job = { start: Math.max(1, checkpoint ? checkpoint - SOBREPOSICAO_S : agora - JANELA_INICIAL_S), end: agora, cursor: null };
     estado.coletas[w] = job;
   }
   let novos = 0;
@@ -729,9 +605,7 @@ async function coletarCarteira(c, estado) {
   try {
     while (paginas < PAGINAS_POR_CARTEIRA_CICLO) {
       const cursorAntes = job.cursor || null;
-      const r = await fetchDados(montarUrlTrades(w, job.start, job.end, cursorAntes), {
-        headers: { Accept: "application/json" },
-      });
+      const r = await fetchDados(montarUrlTrades(w, job.start, job.end, cursorAntes), { headers: { Accept: "application/json" } });
       if (!r.ok) throw new Error(`Data API HTTP ${r.status}${r.status === 429 ? " (rate limited; cursor preservado)" : ""}`);
       const body = await r.json();
       const trades = listaDe(body);
@@ -741,10 +615,7 @@ async function coletarCarteira(c, estado) {
         if (!n || !n.cond || !eEsports(n)) continue;
         const k = chaveTrade(n);
         if (existentes.has(k)) continue;
-        if (existentes.has(chaveTradeAntiga(n))) {
-          existentes.add(k);
-          continue;
-        }
+        if (existentes.has(chaveTradeAntiga(n))) { existentes.add(k); continue; }
         if (estado.pendentes.length >= MAX_PENDENTES) { filaCheia = true; break; }
         existentes.add(k);
         estado.pendentes.push({ id: `${w}|${k}`, w, n, tent: 0, nextTryAt: 0 });
@@ -752,10 +623,7 @@ async function coletarCarteira(c, estado) {
       }
       paginas++;
       const next = body && body.pagination ? body.pagination.next_cursor : null;
-      if (filaCheia) {
-        job.cursor = cursorAntes;
-        break;
-      }
+      if (filaCheia) { job.cursor = cursorAntes; break; }
       if (next) {
         job.cursor = String(next);
         if (paginas >= PAGINAS_POR_CARTEIRA_CICLO) break;
@@ -778,8 +646,7 @@ async function coletar(cfg, estado) {
   await mapLimit(alvos, CONCORRENCIA, async c => {
     try {
       const r = await coletarCarteira(c, estado);
-      novos += r.novos;
-      paginas += r.paginas;
+      novos += r.novos; paginas += r.paginas;
     } catch (e) {
       erros++;
       console.warn(`[${c.w.slice(0, 8)}] ${String(e && e.message || e).slice(0, 180)}`);
@@ -788,9 +655,6 @@ async function coletar(cfg, estado) {
   return { novos, paginas, erros, consultadas: alvos.length };
 }
 
-// -----------------------------------------------------------------------------
-// Carteira removida
-// -----------------------------------------------------------------------------
 function podarCarteirasRemovidas(estado, cfg) {
   const ativas = new Set(cfg.carteiras.map(c => c.w));
   const antes = estado.pendentes.length;
@@ -803,25 +667,18 @@ function sincronizarResumo(estado, cfg) {
   const r = estado.resumo;
   if (!r || r.dia !== diaBR(Date.now()) || !r.apostas) return;
   let mudou = false;
-  for (const w of Object.keys(r.apostas)) {
-    if (!cfg.carteiras.some(c => c.w === w)) { delete r.apostas[w]; mudou = true; }
-  }
+  for (const w of Object.keys(r.apostas)) { if (!cfg.carteiras.some(c => c.w === w)) { delete r.apostas[w]; mudou = true; } }
   const nomes = Object.fromEntries(Object.keys(r.apostas).sort().map(w => [w, nomeCarteira(cfg, w)]));
   if (JSON.stringify(nomes) !== JSON.stringify(r.nomes || {})) { r.nomes = nomes; mudou = true; }
   if (mudou) r.mudou = true;
 }
 
-// -----------------------------------------------------------------------------
-// Busca de metadados do evento (Gamma)
-// -----------------------------------------------------------------------------
 async function buscarEvento(env, n, cacheEventos) {
   const chaveCache = n.eventSlug || `cond:${n.cond}`;
   if (cacheEventos.has(chaveCache)) return cacheEventos.get(chaveCache);
-
   const tentar = async () => {
     let ev = null;
     try {
-      // 1ª tentativa: pelo slug do evento (mais confiável, inclui times)
       if (n.eventSlug) {
         const u = new URL(`${GAMMA_API}/events`);
         u.searchParams.set("slug", n.eventSlug);
@@ -832,7 +689,6 @@ async function buscarEvento(env, n, cacheEventos) {
           if (arr.length) ev = extrairEvento(arr[0], n.cond);
         }
       }
-      // 2ª tentativa: pelo condition_id do mercado
       if (!ev) {
         const u = new URL(`${GAMMA_API}/markets`);
         u.searchParams.set("condition_ids", n.cond);
@@ -842,31 +698,20 @@ async function buscarEvento(env, n, cacheEventos) {
           const arr = Array.isArray(lista) ? lista : (lista && Array.isArray(lista.data) ? lista.data : []);
           const m = arr[0];
           if (m) {
-            const pai = (Array.isArray(m.events) && m.events[0]) || m.event
-              || { markets: [m], title: m.question, slug: m.slug };
+            const pai = (Array.isArray(m.events) && m.events[0]) || m.event || { markets: [m], title: m.question, slug: m.slug };
             ev = extrairEvento(pai, n.cond);
           }
         }
       }
-    } catch (e) {
-      console.warn("buscarEvento: " + limpar(env, e).slice(0, 120));
-    }
+    } catch (e) { console.warn("buscarEvento: " + limpar(env, e).slice(0, 120)); }
     return ev;
   };
-
   let ev = await tentar();
-  if (!ev) {
-    await pausa(400);
-    ev = await tentar();
-  }
-
+  if (!ev) { await pausa(400); ev = await tentar(); }
   cacheEventos.set(chaveCache, ev);
   return ev;
 }
 
-// -----------------------------------------------------------------------------
-// Nome do tópico por partida
-// -----------------------------------------------------------------------------
 function nomeTopicoPartida(ev, n) {
   const times = (ev && ev.times) || extrairTimes(n && n.titulo);
   let base;
@@ -886,48 +731,21 @@ function nomeTopicoPartida(ev, n) {
   return truncar(base, 128);
 }
 
-// -----------------------------------------------------------------------------
-// Corpo da mensagem
-// -----------------------------------------------------------------------------
 function textoGrupo(env, g, cfg, ev) {
   const nome = nomeCarteira(cfg, g.w);
   const n0 = g.itens[0] && g.itens[0].n;
-  const titulo = ev && ev.times
-    ? `${ev.times.a} vs ${ev.times.b}`
-    : (ev && ev.titulo) || (n0 && n0.titulo) || "Partida";
-
-  const quando = ev && ev.inicioMs
-    ? `🕒 ${diaCurtoBR(ev.inicioMs)} · ${horaBR(ev.inicioMs)}`
-    : ev && ev.data
-    ? `📅 ${diaComAnoBR(ev.data)}`
-    : "";
+  const titulo = ev && ev.times ? `${ev.times.a} vs ${ev.times.b}` : (ev && ev.titulo) || (n0 && n0.titulo) || "Partida";
+  const quando = ev && ev.inicioMs ? `🕒 ${diaCurtoBR(ev.inicioMs)} · ${horaBR(ev.inicioMs)}` : ev && ev.data ? `📅 ${diaComAnoBR(ev.data)}` : "";
 
   const corpo = g.itens.map(it => {
     const d = descreverAposta(it.n);
     const valor = Number(it.n.size || 0) * Number(it.n.price || 0);
-    return (
-      `<b>${esc(d.classificacao.rotulo)}</b>\n` +
-      `→ ${esc(d.escolha)}\n` +
-      `<i>${moeda(valor)} · ${quantidade(it.n.size)} cotas @ ${numeroBR(it.n.price, 3)} · ${pct(it.n.price)}</i>`
-    );
+    return `<b>${esc(d.classificacao.rotulo)}</b>\n→ ${esc(d.escolha)}\n<i>${moeda(valor)} · ${quantidade(it.n.size)} cotas @ ${numeroBR(it.n.price, 3)} · ${pct(it.n.price)}</i>`;
   }).join("\n\n");
 
-  return [
-    `🎯 <b>${esc(titulo)}</b>`,
-    quando,
-    ``,
-    `👤 <b>${esc(nome)}</b>`,
-    ``,
-    corpo,
-    ``,
-    `<i>${horaSegBR(Date.now())} · ${VERSAO}</i>`,
-  ].filter(x => x !== "").join("\n");
+  return [`🎯 <b>${esc(titulo)}</b>`, quando, ``, `👤 <b>${esc(nome)}</b>`, ``, corpo, ``, `<i>${horaSegBR(Date.now())} · ${VERSAO}</i>`].filter(x => x !== "").join("\n");
 }
 
-// -----------------------------------------------------------------------------
-// Agrupamento: uma mensagem por (carteira, condição). O tópico é resolvido depois,
-// por evento — então todas as carteiras caem no tópico da partida.
-// -----------------------------------------------------------------------------
 function agrupar(pendentes) {
   const agora = Date.now();
   const prontos = pendentes.filter(it => !it.nextTryAt || it.nextTryAt <= agora);
@@ -940,116 +758,56 @@ function agrupar(pendentes) {
   return [...grupos.values()];
 }
 
-// -----------------------------------------------------------------------------
-// Envio ao Telegram: tópico por partida (compartilhado entre carteiras)
-// -----------------------------------------------------------------------------
 async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
-  if (!g || !g.itens || !g.itens.length) {
-    return { ok: false, desc: "grupo vazio" };
-  }
-
+  if (!g || !g.itens || !g.itens.length) return { ok: false, desc: "grupo vazio" };
   const n = g.itens[0].n;
   const ev = await buscarEvento(env, n, cacheEventos);
   const tent = Math.max(...g.itens.map(it => Number(it.tent || 0)));
 
-  // Sem metadados: aguarda para não criar tópico com nome errado.
   if (!ev && tent < TENTATIVAS_METADADOS) {
-    return {
-      ok: false,
-      status: 0,
-      desc: `aguardando metadados do evento (Gamma) [${tent + 1}/${TENTATIVAS_METADADOS}]`,
-      retryAfter: RETRY_METADADOS_S,
-    };
+    return { ok: false, status: 0, desc: `aguardando metadados do evento (Gamma) [${tent + 1}/${TENTATIVAS_METADADOS}]`, retryAfter: RETRY_METADADOS_S };
   }
 
-  // 1. Determinar chave canônica do tópico.
-  //    Prioridade: mapping persistido (estável) > slug do evento > eventSlug > cond.
   let chaveEv = null;
   if (estado && estado.eventos) {
     const persistido = estado.eventos[n.cond];
     if (persistido && topicos[persistido]) chaveEv = persistido;
   }
-  if (!chaveEv) {
-    chaveEv = (ev && ev.slug) || n.eventSlug || n.cond;
-  }
+  if (!chaveEv) chaveEv = (ev && ev.slug) || n.eventSlug || n.cond;
 
-  // 2. Obter ou criar tópico compartilhado
   let topico = topicos[chaveEv];
   if (!topico || !(topico.id > 0)) {
     const nome = nomeTopicoPartida(ev, n);
-    const r = await enviarComRetentativa(env, "createForumTopic", {
-      chat_id: env.TELEGRAM_CHAT_ID,
-      name: nome,
-    });
+    const r = await enviarComRetentativa(env, "createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: nome });
     if (!r.ok || !r.result || !r.result.message_thread_id) {
-      return {
-        ok: false,
-        status: r.status || 0,
-        desc: "falha ao criar tópico da partida: " + (r.desc || ""),
-      };
+      return { ok: false, status: r.status || 0, desc: "falha ao criar tópico da partida: " + (r.desc || "") };
     }
-    topico = {
-      id: r.result.message_thread_id,
-      nome,
-      inicioMs: (ev && ev.inicioMs) || 0,
-      dia: (ev && ev.data) || diaBR(Date.now()),
-    };
+    topico = { id: r.result.message_thread_id, nome, inicioMs: (ev && ev.inicioMs) || 0, dia: (ev && ev.data) || diaBR(Date.now()) };
     topicos[chaveEv] = topico;
   }
 
-  // 3. Persistir mapping cond -> slug do tópico
-  if (estado) {
-    if (!estado.eventos) estado.eventos = {};
-    estado.eventos[n.cond] = chaveEv;
-  }
+  if (estado) { if (!estado.eventos) estado.eventos = {}; estado.eventos[n.cond] = chaveEv; }
 
-  // 4. Enviar mensagem
-  const corpo = {
-    chat_id: env.TELEGRAM_CHAT_ID,
-    message_thread_id: topico.id,
-    text: textoGrupo(env, g, cfg, ev),
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  };
-
+  const corpo = { chat_id: env.TELEGRAM_CHAT_ID, message_thread_id: topico.id, text: textoGrupo(env, g, cfg, ev), parse_mode: "HTML", disable_web_page_preview: true };
   let r = await enviarComRetentativa(env, "sendMessage", corpo);
 
-  // Tópico apagado manualmente → recria e tenta de novo uma vez
   if (!r.ok && r.status === 400 && /thread|topic|TOPIC_ID_INVALID|TOPIC_DELETED/i.test(r.desc || "")) {
     delete topicos[chaveEv];
     const nome = nomeTopicoPartida(ev, n);
-    const rec = await enviarComRetentativa(env, "createForumTopic", {
-      chat_id: env.TELEGRAM_CHAT_ID,
-      name: nome,
-    });
+    const rec = await enviarComRetentativa(env, "createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: nome });
     if (rec.ok && rec.result && rec.result.message_thread_id) {
-      topico = {
-        id: rec.result.message_thread_id,
-        nome,
-        inicioMs: (ev && ev.inicioMs) || 0,
-        dia: (ev && ev.data) || diaBR(Date.now()),
-      };
+      topico = { id: rec.result.message_thread_id, nome, inicioMs: (ev && ev.inicioMs) || 0, dia: (ev && ev.data) || diaBR(Date.now()) };
       topicos[chaveEv] = topico;
       r = await enviarComRetentativa(env, "sendMessage", { ...corpo, message_thread_id: topico.id });
     }
   }
 
   if (r.ok && r.result) return { ok: true, result: r.result, topicoId: topico.id };
-  return {
-    ok: false,
-    status: r.status || 0,
-    desc: r.desc || `HTTP ${r.status}`,
-    retryAfter: r.status === 429 ? 5 : 0,
-  };
+  return { ok: false, status: r.status || 0, desc: r.desc || `HTTP ${r.status}`, retryAfter: r.status === 429 ? 5 : 0 };
 }
 
-// -----------------------------------------------------------------------------
-// Ciclo principal
-// -----------------------------------------------------------------------------
 async function ciclo(env, origem) {
-  const resultado = {
-    origem, carteiras: 0, consultadas: 0, novos: 0, enviados: 0, falhas: 0, pendentes: 0, erros: [],
-  };
+  const resultado = { origem, carteiras: 0, consultadas: 0, novos: 0, enviados: 0, falhas: 0, pendentes: 0, erros: [] };
   const faltam = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CFG"].filter(k => !env[k]);
   if (faltam.length) return { ...resultado, erros: ["faltam configurações: " + faltam.join(", ")] };
 
@@ -1093,18 +851,12 @@ async function ciclo(env, origem) {
           resultado.falhas++;
           const tentativas = Math.max(...g.itens.map(it => Number(it.tent || 0))) + 1;
           const atraso = Math.max(r.retryAfter || 0, Math.min(300, 5 * (2 ** Math.min(tentativas, 6))));
-          for (const it of g.itens) {
-            it.tent = (it.tent || 0) + 1;
-            it.nextTryAt = Date.now() + atraso * 1000;
-          }
+          for (const it of g.itens) { it.tent = (it.tent || 0) + 1; it.nextTryAt = Date.now() + atraso * 1000; }
           resultado.erros.push(truncar(r.desc || `falha no Telegram (${r.status})`, 220));
         }
       } catch (e) {
         resultado.falhas++;
-        for (const it of g.itens) {
-          it.tent = (it.tent || 0) + 1;
-          it.nextTryAt = Date.now() + Math.min(300, 5 * (2 ** Math.min(it.tent, 6))) * 1000;
-        }
+        for (const it of g.itens) { it.tent = (it.tent || 0) + 1; it.nextTryAt = Date.now() + Math.min(300, 5 * (2 ** Math.min(it.tent, 6))) * 1000; }
         resultado.erros.push(truncar(limpar(env, e), 220));
       }
     }
@@ -1117,7 +869,6 @@ async function ciclo(env, origem) {
     resultado.erros.push(truncar(limpar(env, e), 300));
   } finally {
     try {
-      // Limpa mappings órfãos (tópicos podados por idade ou inexistentes)
       if (estado && estado.eventos && topicos) {
         const limite = diaBR(Date.now() - DIAS_TOPICO * 86400000);
         for (const cond of Object.keys(estado.eventos)) {
@@ -1137,17 +888,11 @@ async function ciclo(env, origem) {
   return resultado;
 }
 
-// -----------------------------------------------------------------------------
-// HTTP e cron
-// -----------------------------------------------------------------------------
-async function salvarCarteirasPayload(env, body) {
-  return salvarCarteiras(env, body && body.carteiras, body && body.base);
-}
+async function salvarCarteirasPayload(env, body) { return salvarCarteiras(env, body && body.carteiras, body && body.base); }
 function autorizado(req, env, body) {
   if (!env.CHAVE) return false;
   const auth = req.headers.get("Authorization") || "";
-  const token = auth.replace(/^Bearer\s+/i, "").trim()
-    || (body && typeof body.chave === "string" ? body.chave : "");
+  const token = auth.replace(/^Bearer\s+/i, "").trim() || (body && typeof body.chave === "string" ? body.chave : "");
   return token === env.CHAVE;
 }
 
@@ -1175,9 +920,7 @@ export default {
     }
 
     let body = null;
-    try { body = await req.json(); } catch (_) {
-      return jsonResp({ ok: false, erro: "corpo JSON inválido" }, 400);
-    }
+    try { body = await req.json(); } catch (_) { return jsonResp({ ok: false, erro: "corpo JSON inválido" }, 400); }
     if (!autorizado(req, env, body)) return jsonResp({ ok: false, erro: "não autorizado" }, 401);
 
     try {
@@ -1188,9 +931,7 @@ export default {
           const cfg = await lerConfig(env);
           await atualizarListaCarteiras(env, estado, cfg, true);
           await salvarEstado(env, estado);
-        } catch (e) {
-          console.warn("falha ao atualizar lista após /config: " + limpar(env, e));
-        }
+        } catch (e) { console.warn("falha ao atualizar lista após /config: " + limpar(env, e)); }
         return jsonResp({ ok: true, ...salvos, versao: VERSAO });
       }
 
@@ -1202,19 +943,14 @@ export default {
           const cfg = await lerConfig(env);
           await atualizarListaCarteiras(env, estado, cfg, true);
           await salvarEstado(env, estado);
-        } catch (e) {
-          console.warn("falha ao atualizar lista após /notify: " + limpar(env, e));
-        }
+        } catch (e) { console.warn("falha ao atualizar lista após /notify: " + limpar(env, e)); }
       }
       out.ciclo = await ciclo(env, "manual");
       return jsonResp(out);
     } catch (e) {
       if (e && e.conflito) {
         const atual = await lerConfig(env).catch(() => ({ carteiras: [], atualizado: null }));
-        return jsonResp({
-          ok: false, conflito: true, erro: "lista alterada em outro aparelho",
-          carteiras: atual.carteiras, atualizado: atual.atualizado, versao: VERSAO
-        }, 409);
+        return jsonResp({ ok: false, conflito: true, erro: "lista alterada em outro aparelho", carteiras: atual.carteiras, atualizado: atual.atualizado, versao: VERSAO }, 409);
       }
       return jsonResp({ ok: false, erro: truncar(limpar(env, e), 300), versao: VERSAO }, 400);
     }
