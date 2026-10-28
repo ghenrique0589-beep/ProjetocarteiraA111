@@ -1,0 +1,21 @@
+{
+  "name": "shy-flower-020e",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-01",
+  "kv_namespaces": [
+    {
+      "binding": "KV_BINDING",
+      "id": "ac418cd3ead446ca91c4c1e955708d96"
+    }
+  ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "vars": {
+    "TELEGRAM_CHAT_ID": "-1003960783311"
+  },
+  "keep_vars": true,
+  "observability": {
+    "enabled": true
+  }
+}
