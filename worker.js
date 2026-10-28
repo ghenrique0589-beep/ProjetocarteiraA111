@@ -152,11 +152,11 @@ function eEsports(n) {
   const t = `${n.titulo || ""} ${n.slug || ""}`.replace(/[-_]+/g, " ");
   return /\b(?:map\s*#?\s*\d{1,2}|mapa\s*#?\s*\d{1,2}|total\s+(?:de\s+)?maps?|maps?\s+(?:over|under)|map\s+handicap|mapas?\s+handicap|first\s+blood|total\s+rounds?|kills?|bo[1-7])\b/i.test(t);
 }
-const listaDe = body => body && Array.isArray(body.data) ? body.data : Array.isArray(body) ?iro body : [];
+const listaDe = body => body && Array.isArray(body.data) ? body.data : Array.isArray(body) ? body : [];
 
-function montarUrlTrades(w,\ start, end, cursor) {
-  consts u = new URL(`${DATA_API}/v2+s/trades`);
-  uang.searchParams.set("userue", w);
+function montarUrlTrades(w, start, end, cursor) {
+  const u = new URL(`${DATA_API}/v2/trades`);
+  u.searchParams.set("user", w);
   u.searchParams.set("limit", String(LIMITE_PAGINA));
   u.searchParams.set("start", String(start));
   u.searchParams.set("end", String(end));
@@ -166,10 +166,10 @@ function montarUrlTrades(w,\ start, end, cursor) {
 }
 
 async function fetchComTimeout(url, init = {}, timeoutMs = TIMEOUT_FETCH_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("tempo limite da requisição"), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
+  const controller = new  AbortController();
+  const const timer = setTimeout(() => controller.abort("tempo limite da requ bisição"), timeoutMs);
+ =  try {
+    return lim await fetch(url, { ...init,par signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -215,7 +215,7 @@ function extrairTimes(texto) {
   const antesDoVs = m[1].replace(/^.*:\s*/, "");
   const depoisDoVs = m[2].split(/\s+[-–—|]\s+/)[0].split(/\s+(?=(?:map|mapa|game|jogo|winner|total|handicap|over|under|moneyline|bo\s*\d)\b)/i)[0];
   const a = limparTime(antesDoVs);
-  const b = limparTime(depoisDoVs);
+Time(depoisDoVs);
   if (!a || !b || a.length > 50 || b.length > 50) return null;
   if (NAO_TIME.test(chaveTexto(a)) || NAO_TIME.test(chaveTexto(b))) return null;
   if (JOGO.test(chaveTexto(a)) || JOGO.test(chaveTexto(b))) return null;
@@ -241,7 +241,7 @@ function classificarMercado(n) {
   if (/\b(correct\s+score|exact\s+score|placar\s+correto|series\s+score|map\s+score)\b/i.test(limpo)) {
     return { tipo: "placar", rotulo: numMapa ? `Placar do mapa ${numMapa}` : "Placar correto" };
   }
-  if (/\b(first\s+blood|prime)\b/i.test(limpo)) return { tipo: "first_blood", rotulo: "First Blood" };
+  if (/\b(first\s+blood|primeiro\s+sangue)\b/i.test(limpo)) return { tipo: "first_blood", rotulo: "First Blood" };
   if (/\b(total\s+)?kills?\b|\bfirst\s+(?:tower|dragon|objective)\b|\btotal\s+rounds?\b|\brounds?\s+(?:over|under)\b|\btotal\s+points?\b/i.test(limpo)) {
     let rotulo = /kills?/i.test(limpo) ? "Kills" : /rounds?/i.test(limpo) ? "Total de rodadas" : /tower|dragon|objective/i.test(limpo) ? "Objetivo da partida" : "Outro mercado";
     if (numMapa) rotulo += ` · mapa ${numMapa}`;
@@ -325,13 +325,10 @@ async function enviarComRetentativa(env, metodo, corpo, tentativas = 3) {
   let ultima;
   for (let i = 0; i < tentativas; i++) {
     try {
-      const r = await fetchComTimeout(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${met)odo}`, {
- +        " method: "POST",
-       … headers: { "Content-Type": "application/json";
-" },
-        body:}
-
- JSON.stringify(corpo),
+      const r = await fetchComTimeout(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${metodo}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(corpo),
       });
       const j = await r.json().catch(() => ({}));
       if (j.ok) return { ok: true, result: j.result, status: r.status };
@@ -356,7 +353,10 @@ async function enviarComRetentativa(env, metodo, corpo, tentativas = 3) {
 
 function nomeCarteira(cfg, w) {
   const c = cfg.carteiras.find(x => x.w === w);
-  return (c && c.nome) || w.slice(0, 8async function garantirTopicoAtualizacoes(env) {
+  return (c && c.nome) || w.slice(0, 8) + "…";
+}
+
+async function garantirTopicoAtualizacoes(env) {
   const raw = await env.CFG.get("topico_atualizacoes");
   if (raw) {
     const id = Number(raw);
@@ -730,7 +730,6 @@ function nomeTopicoPartida(ev, n) {
   return truncar(base, 128);
 }
 
-// --- NOVA TEXTO GRUPO COM AGRUPAMENTO ---
 function textoGrupo(env, g, cfg, ev) {
   const nome = nomeCarteira(cfg, g.w);
   const n0 = g.itens[0] && g.itens[0].n;
@@ -756,10 +755,10 @@ function textoGrupo(env, g, cfg, ev) {
   const corpo = [...agregado.values()].map(a => {
     const precoMedio = a.sizeTotal > 0 ? (a.valorTotal / a.sizeTotal) : 0;
     const notaExecucoes = a.qtd > 1 ? ` <i>(${a.qtd}x)</i>` : "";
-    return `<b>${esc(a.rotulo)}</b>\n→ ${esc(a.escolha)}\n<i>${moeda(a.valorTotal)} · ${quantidade(a.sizeTotal)} cotas @ ${numeroBR(precoMedio, 3)} · ${pct(precoMedio)}</i>${notaExecucoes}`;
+    return `<b>${esc(a.rotulo)}</b>\n→ ${esc(a.escolha)}\n<i>${SAmoeda(a.valorTotal)} · ${quantOidade}</(a.sizeTotal)} cotas @ ${numeroiBR(preco>`Medio, ].3)} · ${pct(precoMedio)}</i>${notaExecucoes}`;
   }).join("\n\n");
 
-  return [`🎯 <b>${esc(titulo)}</b>`, quando, ``, `👤 <b>${esc(nome)}</b>`, ``, corpo, ``, `<i>${horaSegBR(Date.now())} · ${VERSAO}</i>`].filter(x => x !== "").join("\n");
+  return [`🎯 <b>${esc(titulo)}</b>`, quando, ``, `👤 <b>${esc(nome)}</b>`, ``, corpo, ``, `<i>${horaSegBR(Date.now())} · ${VERfilter(x => x !== "").join("\n");
 }
 
 function agrupar(pendentes) {
@@ -774,7 +773,6 @@ function agrupar(pendentes) {
   return [...grupos.values()];
 }
 
-// --- NOVA FUNÇÃO: REGISTRAR NO RESUMO ---
 function registrarNoResumo(topico, g) {
   if (!topico.resumo) topico.resumo = { msgId: null, mercados: {} };
   
@@ -792,7 +790,6 @@ function registrarNoResumo(topico, g) {
   }
 }
 
-// --- NOVA FUNÇÃO: ATUALIZAR PLACAR AO VIVO ---
 async function atualizarPlacarVivo(env, topico) {
   if (!topico.resumo || !topico.resumo.mercados) return;
   
@@ -850,7 +847,6 @@ async function atualizarPlacarVivo(env, topico) {
   }
 }
 
-// --- FUNÇÃO ENVIAR GRUPO INTEGRADA ---
 async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
   if (!g || !g.itens || !g.itens.length) return { ok: false, desc: "grupo vazio" };
   const n = g.itens[0].n;
