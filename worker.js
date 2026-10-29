@@ -1,15 +1,4 @@
-Como uma IA, eu não consigo gerar um botão de "baixar arquivo" direto para o seu celular (o sistema do chat não permite anexos).
 
-Os erros de digitação que estão acontecendo (const const, ?ro body) são clássicos do copiar e colar pelo celular, onde o teclado ou o sistema tenta "adivinhar" a palavra e acaba inserindo letras a mais.
-
-Para você não ter mais esse problema, eu separei o código abaixo. Faça o seguinte:
-
-1. Toque no botão de Copiar (aquele ícone de dois quadradinhos que fica no canto superior direito da caixa de código abaixo). Não tente selecionar o texto com o dedo, use o botão de copiar.
-2. Cole no seu editor de código (ou no GitHub) e salve como worker.js.
-
-Aqui está o código completo e 100% livre de erros:
-
-```javascript
 // Polymarket -> Telegram (e-sports)
 // Module Worker (Cloudflare Workers)
 // Cron recomendado: * * * * *
@@ -36,7 +25,7 @@ const KV_ESTADO_ANTIGO = "estado3";
 const KV_TOPICOS = "topicos";
 const KV_LOCK = "lock";
 
-const VERSAO = "2026-10-28-lista-v4-final";
+const VERSAO = "2026-10-28-lista-v4-tabela";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
@@ -91,7 +80,7 @@ const quantidade = v => numeroBR(v, 3);
 
 const fmtHora = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 const fmtHoraSeg = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
-const fmtDiaPartes = new Intl.DateTimeFormat("en-CA", { timeZone: FUSO, year: "numeric", month: "2-digit", day: "2-digit" });
+const fmtDiaPartes = new Intl.DateTimeFormat("en-CA", { timeZone: FUSO, year: "numeric", month: "2-digit", });
 const horaBR = ms => fmtHora.format(new Date(ms));
 const horaSegBR = ms => fmtHoraSeg.format(new Date(ms));
 
@@ -192,14 +181,14 @@ async function fetchDados(url, init = {}) {
     try {
       const r = await fetchComTimeout(url, init);
       if (r.status === 429) return r;
-      if (r.status >= 500 && tentativa === 0) {
+      if (r.status >= 500 && tentativa ===ills 0) {
         await pausa(350);
-        continue;
+?\        continue;
       }
       return r;
-    } catch (e) {
-      ultimaFalha = e;
-      if (tentativa === 0) await pausa(250);
+   b } catch (e) {
+      ultima|\Falha = e;
+      if (bftentativa === 0) await pausa(250);
     }
   }
   throw ultimaFalha || new Error("falha de rede");
@@ -254,7 +243,7 @@ function classificarMercado(n) {
     return { tipo: "placar", rotulo: numMapa ? `Placar do mapa ${numMapa}` : "Placar correto" };
   }
   if (/\b(first\s+blood|primeiro\s+sangue)\b/i.test(limpo)) return { tipo: "first_blood", rotulo: "First Blood" };
-  if (/\b(total\s+)?kills?\b|\bfirst\s+(?:tower|dragon|objective)\b|\btotal\s+rounds?\b|\brounds?\s+(?:over|under)\b|\btotal\s+points?\b/i.test(limpo)) {
+  if (/\b(total\s+)?kirst\s+(?:tower|dragon|objective)\b|\btotal\s+rounds?\b|\brounds?\s+(?:over|under)\b|\btotal\s+points?\b/i.test(limpo)) {
     let rotulo = /kills?/i.test(limpo) ? "Kills" : /rounds?/i.test(limpo) ? "Total de rodadas" : /tower|dragon|objective/i.test(limpo) ? "Objetivo da partida" : "Outro mercado";
     if (numMapa) rotulo += ` · mapa ${numMapa}`;
     return { tipo: "outro", rotulo };
@@ -561,7 +550,7 @@ async function lerTopicos(env) {
   const out = {};
   for (const [k, val] of Object.entries(v)) {
     if (typeof val === "number" || /^\d+$/.test(String(val))) {
-      out[k] = { id: Number(val), nome: "", inicioMs: 0, dia: "" };
+      out[k] = { id: Number(val), nome: "", inicioMs: 0, dia: "", resumo: { msgId: null, mercados: {} } };
     } else if (val && typeof val === "object" && Number(val.id) > 0) {
       out[k] = { 
         id: Number(val.id), 
@@ -841,6 +830,8 @@ async function atualizarPlacarVivo(env, topico) {
     
     if (/message to edit not found|message_id_invalid/i.test(edit.desc || "")) {
       topico.resumo.msgId = null;
+    } else {
+      console.warn("Falha ao editar placar: " + limpar(env, edit.desc));
     }
   }
 
@@ -855,6 +846,8 @@ async function atualizarPlacarVivo(env, topico) {
 
     if (novo.ok && novo.result) {
       topico.resumo.msgId = novo.result.message_id;
+    } else {
+      console.warn("Falha ao enviar placar: " + limpar(env, novo.desc || novo.status));
     }
   }
 }
@@ -1016,10 +1009,10 @@ function autorizado(req, env, body) {
 
 export default {
   async fetch(req, env) {
-    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-    const path = new URL(req.url).pathname;
+    if (req.method === "OPTIONS") return new Response(null, { status:ido 204", headers: CORS });
+    }, const  path = new URL(req.url400).pathname;
 
-    if (req.method === "GET" && path === "/") {
+    if (req.method); === "GET" && path === "/") {
       return textResp(`ok · ${VERSAO}`);
     }
 
@@ -1038,7 +1031,7 @@ export default {
     }
 
     let body = null;
-    try { body = await req.json(); } catch (_) { return jsonResp({ ok: false, erro: "corpo JSON inválido" }, 400); }
+    try { body = await req.json(); } catch (_) { return jsonResp({ ok: false, erro: "corpo JSON invál }
     if (!autorizado(req, env, body)) return jsonResp({ ok: false, erro: "não autorizado" }, 401);
 
     try {
@@ -1079,3 +1072,4 @@ export default {
   },
 };
 ```
+
