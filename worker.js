@@ -25,7 +25,7 @@ const KV_ESTADO_ANTIGO = "estado3";
 const KV_TOPICOS = "topicos";
 const KV_LOCK = "lock";
 
-const VERSAO = "2026-10-28-lista-v4-tabela";
+const VERSAO = "2026-10-28-lista-v5-limpa";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
@@ -80,18 +80,24 @@ const quantidade = v => numeroBR(v, 3);
 
 const fmtHora = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 const fmtHoraSeg = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
-const fmtDiaPartes = new Intl.DateTimeFormat("en-CA", { timeZone: FUSO, year: "numeric", month: "2-digit", });
+const fmtDiaPartes = new Intl.DateTimeFormat("en-CA", { timeZone: FUSO, year: "numeric", month: "2-digit", day: "2-digit" });
 const horaBR = ms => fmtHora.format(new Date(ms));
 const horaSegBR = ms => fmtHoraSeg.format(new Date(ms));
 
 function diaBR(ms) {
-  const p = Object.fromEntries(fmtDiaPartes.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  const d = new Date(Number(ms));
+  if (!Number.isFinite(d.getTime())) return "0000-00-00";
+  const p = Object.fromEntries(fmtDiaPartes.formatToParts(d).map(x => [x.type, x.value]));
+  if (!p.year || !p.month || !p.day) return "0000-00-00";
   return `${p.year}-${p.month}-${p.day}`;
 }
-const diaCurtoBR = ms => `${diaBR(ms).slice(8, 10)}/${diaBR(ms).slice(5, 7)}`;
+const diaCurtoBR = ms => {
+  const iso = diaBR(ms);
+  return iso === "0000-00-00" ? "??/??" : `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
+};
 const diaComAnoBR = iso => {
-  const [y, m, d] = String(iso || "").split("-");
-  return y && m && d ? `${d}/${m}/${y}` : "data não identificada";
+  const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : "data não identificada";
 };
 
 function paraMs(v) {
@@ -433,29 +439,27 @@ function registrarAposta(estado, g) {
 async function atualizarResumo(env, estado, cfg) {
   const r = estado.resumo;
   if (!r || !r.mudou) return false;
-  const linhas = Object.keys(r.apostas || {}).sort().map(w => {
+  const linhas = Object.keys(r.apostas || {}).sort().map((w, i) => {
     const nome = (r.nomes && r.nomes[w]) || nomeCarteira(cfg, w);
-    return `${esc(nome.padEnd(12).slice(0, 12))} ${String(r.apostas[w]).padStart(4)}`;
+    return `👤 <b>${String(i + 1).padStart(2, "0")} · ${esc(nome)}:</b> ${r.apostas[w]} aposta(s)`;
   });
   const total = Object.values(r.apostas || {}).reduce((a, b) => a + b, 0);
-  const texto = `📊 <b>RESUMO DIÁRIO · ${diaComAnoBR(r.dia)}</b>\n<pre>Carteira      Apostas\n${"─".repeat(20)}\n${linhas.length ? linhas.join("\n") : "— nenhuma —"}\n${"─".repeat(20)}\nTOTAL${" ".repeat(9)}${String(total).padStart(4)}</pre>\nContagem de execuções de aposta\nentregues pelo bot · Atualizado às ${horaBR(Date.now())}\n<code>${VERSAO}</code>`;
-  const corpo = {
-    chat_id: env.TELEGRAM_CHAT_ID, text: texto, parse_mode: "HTML", disable_web_page_preview: true,
-  };
+  const texto = `📊 <b>RESUMO DIÁRIO · ${diaComAnoBR(r.dia)}</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `${linhas.length ? linhas.join("\n") : "— nenhuma aposta —"}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 <b>TOTAL:</b> ${total} aposta(s)\n\n` +
+    `<i>Atualizado às ${horaBR(Date.now())} · ${VERSAO}</i>`;
+  const corpo = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, parse_mode: "HTML", disable_web_page_preview: true };
   if (r.msgId) {
     const e = await enviarComRetentativa(env, "editMessageText", { ...corpo, message_id: r.msgId });
     if (e.ok || /not[ _]modified/i.test(e.desc || "")) { r.mudou = false; return true; }
-    if (/not found|can't be edited|message_id_invalid|message to edit/i.test((e.desc || "").toLowerCase())) { r.msgId = null; }
-    else {
-      console.warn("resumo diário: " + limpar(env, e.desc).slice(0, 160));
-      return false;
-    }
+    if (/not found|can't be edited|message_id_invalid|message to edit/i.test((e.desc || "").toLowerCase())) r.msgId = null;
+    else { console.warn("resumo diário: " + limpar(env, e.desc).slice(0, 160)); return false; }
   }
   const topicoResumo = Number(env.TELEGRAM_TOPICO_RESUMO) || 0;
   let novo = await enviarComRetentativa(env, "sendMessage", topicoResumo ? { ...corpo, message_thread_id: topicoResumo } : corpo);
-  if (!novo.ok && topicoResumo && novo.status === 400 && /thread|topic/i.test(novo.desc || "")) {
-    novo = await enviarComRetentativa(env, "sendMessage", corpo);
-  }
+  if (!novo.ok && topicoResumo && novo.status === 400 && /thread|topic/i.test(novo.desc || "")) novo = await enviarComRetentativa(env, "sendMessage", corpo);
   if (novo.ok && novo.result) { r.msgId = novo.result.message_id; r.mudou = false; return true; }
   console.warn("resumo diário não atualizado: " + limpar(env, novo.desc).slice(0, 160));
   return false;
@@ -793,62 +797,37 @@ function registrarNoResumo(topico, g) {
 
 async function atualizarPlacarVivo(env, topico) {
   if (!topico.resumo || !topico.resumo.mercados) return;
-  
   let totalGeral = 0;
   let totalApostas = 0;
-
   const entradas = Object.entries(topico.resumo.mercados)
     .sort((a, b) => b[1].valor - a[1].valor)
     .map(([mercado, dados]) => {
-      totalGeral += dados.valor;
-      totalApostas += dados.qtd;
-      
-      let nomeCurto = mercado.length > 22 ? mercado.slice(0, 21) + "…" : mercado;
-      return `${nomeCurto.padEnd(23)} ${String(dados.qtd).padStart(3)}  US$ ${numeroBR(dados.valor, 2).padStart(10)}`;
-    });
-
-  const cabecalho = `Mercado                 Qtd       Total`;
-  const separador = "─".repeat(46);
-
+      totalGeral += Number(dados.valor || 0);
+      totalApostas += Number(dados.qtd || 0);
+      return `▪️ <b>${esc(mercado)}</b>\n   └ ${dados.qtd} aposta(s) · ${moeda(dados.valor)}`;
+    }).join("\n\n");
   const texto = `📊 <b>PLACAR AO VIVO</b>\n` +
-                `🎯 <b>${esc(topico.nome)}</b>${topico.inicioMs > 0 ? ` · ${horaBR(topico.inicioMs)}` : ""}\n\n` +
-                `<pre>${cabecalho}\n${separador}\n` +
-                `${entradas.join("\n")}\n` +
-                `${separador}\n` +
-                `TOTAL GERAL           ${String(totalApostas).padStart(3)}  US$ ${numeroBR(totalGeral, 2).padStart(10)}</pre>`;
-
+    `🎯 <b>${esc(topico.nome || "Partida")}</b>${topico.inicioMs > 0 ? ` · ${horaBR(topico.inicioMs)}` : ""}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `${entradas || "— nenhuma aposta registrada —"}\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 <b>TOTAL GERAL:</b> ${moeda(totalGeral)} · ${totalApostas} aposta(s)`;
   if (topico.resumo.msgId) {
     const edit = await enviarComRetentativa(env, "editMessageText", {
-      chat_id: env.TELEGRAM_CHAT_ID,
-      message_id: topico.resumo.msgId,
-      text: texto,
-      parse_mode: "HTML",
-      disable_web_page_preview: true
+      chat_id: env.TELEGRAM_CHAT_ID, message_id: topico.resumo.msgId, text: texto,
+      parse_mode: "HTML", disable_web_page_preview: true
     });
-    
-    if (edit.ok || /message is not modified/i.test(edit.desc || "")) return;
-    
-    if (/message to edit not found|message_id_invalid/i.test(edit.desc || "")) {
-      topico.resumo.msgId = null;
-    } else {
-      console.warn("Falha ao editar placar: " + limpar(env, edit.desc));
-    }
+    if (edit.ok || /message is not modified|not[ _]modified/i.test(edit.desc || "")) return;
+    if (/message to edit not found|message_id_invalid|can't be edited/i.test((edit.desc || "").toLowerCase())) topico.resumo.msgId = null;
+    else { console.warn("Falha ao editar placar: " + limpar(env, edit.desc).slice(0, 160)); return; }
   }
-
   if (!topico.resumo.msgId) {
     const novo = await enviarComRetentativa(env, "sendMessage", {
-      chat_id: env.TELEGRAM_CHAT_ID,
-      message_thread_id: topico.id,
-      text: texto,
-      parse_mode: "HTML",
-      disable_web_page_preview: true
+      chat_id: env.TELEGRAM_CHAT_ID, message_thread_id: topico.id, text: texto,
+      parse_mode: "HTML", disable_web_page_preview: true
     });
-
-    if (novo.ok && novo.result) {
-      topico.resumo.msgId = novo.result.message_id;
-    } else {
-      console.warn("Falha ao enviar placar: " + limpar(env, novo.desc || novo.status));
-    }
+    if (novo.ok && novo.result) topico.resumo.msgId = novo.result.message_id;
+    else console.warn("Falha ao enviar placar: " + limpar(env, novo.desc || novo.status).slice(0, 160));
   }
 }
 
