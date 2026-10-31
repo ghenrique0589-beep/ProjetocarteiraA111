@@ -27,7 +27,7 @@ const KV_CFG = "CFG";
 const KV_ESTADO = "estado4";
 const KV_TOPICOS = "topicos";
 
-const VERSAO = "2026-10-31-placar-v2";
+const VERSAO = "2026-10-31-placar-v3";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
@@ -857,7 +857,7 @@ function textoPlacar(topico, cfg) {
       const partes = [`<b>${esc(it.escolha)}</b>`, dolar(it.valor)];
       if (gr.itens.length > 1 && gr.total > 0) {
         const p = it.valor / gr.total * 100;
-        partes.push(p < 1 ? "<1%" : p > 99 ? ">99%" : `${Math.round(p)}%`);
+        partes.push(p < 1 ? "&lt;1%" : p > 99 ? "&gt;99%" : `${Math.round(p)}%`);
       }
       if (it.cotas > 0) partes.push(`@${centavos(it.valor / it.cotas)}`);
       const ws = Array.isArray(it.ws) ? it.ws : [];
