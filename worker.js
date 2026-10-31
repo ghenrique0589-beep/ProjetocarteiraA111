@@ -8,11 +8,17 @@
 //   TELEGRAM_CHAT_ID       ID do supergrupo com tópicos ativados
 //
 // Binding KV (namespace binding name: CFG):
-//   CFG / CFG               configuração das carteiras
-//   CFG / estado4           fila, cursores, deduplicação, resumo do dia, eventos
-//   CFG / topicos           tópicos por partida (chave = slug do evento)
-//   CFG / lock              (não é mais usada: a trava foi removida para economizar gravações)
+//   CFG / CFG                  configuração das carteiras
+//   CFG / estado4              fila, cursores, deduplicação, tópicos, resumo do dia, eventos
 //   CFG / topico_atualizacoes  ID do tópico "Atualizações"
+//   CFG / topicos              legado: lido só na migração, não é mais gravado
+//
+// Gravações no KV (plano grátis: 1.000 por dia, renovam à meia-noite UTC):
+//   - o estado só é gravado quando algo muda de verdade, ou a cada 15 min (checkpoint);
+//   - ANTES de enviar, grava o que foi capturado. Se essa gravação falhar, nada é enviado,
+//     então cota esgotada não vira spam a cada minuto;
+//   - DEPOIS de enviar, grava de novo para tirar da fila o que saiu.
+// Sem trava no KV: cada ciclo tem prazo (PRAZO_*) para não se sobrepor ao seguinte.
 
 const DATA_API = "https://data-api.polymarket.com";
 const GAMMA_API = "https://gamma-api.polymarket.com";
@@ -21,10 +27,9 @@ const FUSO = "America/Sao_Paulo";
 const KV_CFG = "CFG";
 const KV_ESTADO = "estado4";
 const KV_ESTADO_ANTIGO = "estado3";
-const KV_TOPICOS = "topicos";
-const KV_LOCK = "lock";
+const KV_TOPICOS_LEGADO = "topicos";
 
-const VERSAO = "2026-10-29-kv-v2";
+const VERSAO = "2026-10-30-kv-v3";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
@@ -35,15 +40,17 @@ const LIMITE_PAGINA = 500;
 const CONCORRENCIA = 4;
 const SOBREPOSICAO_S = 300;
 const JANELA_INICIAL_S = 3600;
-const MAX_VISTOS = 2000;
+const JANELA_MAXIMA_S = 3 * 3600; // após uma falha longa, não recupera trades mais antigos que isso
 const MAX_PENDENTES = 3000;
 const MAX_AVISOS = 6;
-const LOCK_MS = 55000;
+const MAX_TENTATIVAS = 10; // teto do contador de falhas: falha persistente não gera gravação infinita
 const DIAS_TOPICO = 30;
 const TIMEOUT_FETCH_MS = 10000;
 const TENTATIVAS_METADADOS = 3;
 const RETRY_METADADOS_S = 30;
-const CHECKPOINT_MS = 15 * 60 * 1000; // grava o ponto de leitura no máximo a cada 15 min quando nada mudou
+const CHECKPOINT_MS = 15 * 60 * 1000;
+const PRAZO_COLETA_MS = 25000;
+const PRAZO_ENVIO_MS = 45000;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -152,6 +159,11 @@ function chaveTrade(n) {
 }
 function chaveTradeAntiga(n) {
   return [n.tx, n.cond, n.idx, n.side, n.size.toFixed(4), n.price.toFixed(4)].join("|");
+}
+// Timestamp (s) embutido na chave: campo 6 de 9 (ver chaveTrade). NaN para chaves antigas.
+function tsDaChave(k) {
+  const p = String(k).split("|");
+  return p.length === 9 ? Number(p[5]) : NaN;
 }
 function eEsports(n) {
   const slugTexto = `${n.eventSlug || ""} ${n.slug || ""}`;
@@ -410,7 +422,9 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
   };
   if (estado.lista.msgId) {
     const edit = await enviarComRetentativa(env, "editMessageText", { ...corpo, message_id: estado.lista.msgId });
-    if (edit.ok) { estado.lista.hash = hashAtual; estado.lista.dia = diaHoje; estado.lista.mudou = false; return true; }
+    if (edit.ok || /not[ _]modified/i.test(edit.desc || "")) {
+      estado.lista.hash = hashAtual; estado.lista.dia = diaHoje; estado.lista.mudou = false; return true;
+    }
     if (/message to edit not found|message_id_invalid|can't be edited/i.test(edit.desc || "")) {
       estado.lista.msgId = null;
     } else {
@@ -527,35 +541,10 @@ async function migrarFilaAntiga(env) {
     return [];
   }
 }
-async function lerEstado(env) {
-  const raw = await env.CFG.get(KV_ESTADO);
-  let e;
-  if (raw) {
-    try { e = JSON.parse(raw); } catch (_) { throw new Error("estado4 corrompido; interrompi para não sobrescrever a fila"); }
-  } else {
-    e = { pendentes: await migrarFilaAntiga(env), vistos: {}, ultimo: {}, coletas: {}, resumo: null, lista: null, eventos: {}, indiceCarteira: 0 };
-  }
-  e.pendentes = Array.isArray(e.pendentes) ? e.pendentes.filter(it => it && it.n && it.w) : [];
-  e.vistos = e.vistos && typeof e.vistos === "object" ? e.vistos : {};
-  e.ultimo = e.ultimo && typeof e.ultimo === "object" ? e.ultimo : {};
-  e.coletas = e.coletas && typeof e.coletas === "object" ? e.coletas : {};
-  e.resumo = e.resumo && typeof e.resumo === "object" ? e.resumo : null;
-  e.lista = e.lista && typeof e.lista === "object" ? e.lista : null;
-  e.eventos = e.eventos && typeof e.eventos === "object" && !Array.isArray(e.eventos) ? e.eventos : {};
-  e.indiceCarteira = Number.isInteger(e.indiceCarteira) && e.indiceCarteira >= 0 ? e.indiceCarteira : 0;
-  return e;
-}
-async function salvarEstado(env, estado) { await env.CFG.put(KV_ESTADO, JSON.stringify(estado)); }
 
-// Imagem do estado SEM o ponto de leitura (ultimo/salvoEm), que muda a cada minuto.
-// Serve para saber se houve mudança "de verdade" e só então gravar no KV.
-function semCheckpoint(e) {
-  const { ultimo, salvoEm, ...resto } = e;
-  return JSON.stringify(resto);
-}
-
-async function lerTopicos(env) {
-  const raw = await env.CFG.get(KV_TOPICOS);
+// Leitura única da chave legada "topicos" (só para migração).
+async function lerTopicosLegado(env) {
+  const raw = await env.CFG.get(KV_TOPICOS_LEGADO);
   if (!raw) return {};
   let v;
   try { v = JSON.parse(raw); } catch (_) { return null; }
@@ -565,49 +554,109 @@ async function lerTopicos(env) {
     if (typeof val === "number" || /^\d+$/.test(String(val))) {
       out[k] = { id: Number(val), nome: "", inicioMs: 0, dia: "", resumo: { msgId: null, mercados: {} } };
     } else if (val && typeof val === "object" && Number(val.id) > 0) {
-      out[k] = { 
-        id: Number(val.id), 
-        nome: String(val.nome || ""), 
-        inicioMs: Number(val.inicioMs || 0), 
+      out[k] = {
+        id: Number(val.id),
+        nome: String(val.nome || ""),
+        inicioMs: Number(val.inicioMs || 0),
         dia: String(val.dia || ""),
-        resumo: val.resumo && typeof val.resumo === "object" ? val.resumo : { msgId: null, mercados: {} }
+        resumo: val.resumo && typeof val.resumo === "object" ? val.resumo : { msgId: null, mercados: {} },
       };
     }
   }
   return out;
 }
-async function salvarTopicos(env, topicos) {
+
+async function lerEstado(env) {
+  const raw = await env.CFG.get(KV_ESTADO);
+  let e;
+  if (raw) {
+    try { e = JSON.parse(raw); } catch (_) { throw new Error("estado4 corrompido; interrompi para não sobrescrever a fila"); }
+  } else {
+    e = { pendentes: await migrarFilaAntiga(env), vistos: {}, ultimo: {}, coletas: {}, resumo: null, lista: null, eventos: {} };
+  }
+  delete e.indiceCarteira; // campo da versão anterior; o rodízio agora usa o relógio
+  e.pendentes = Array.isArray(e.pendentes) ? e.pendentes.filter(it => it && it.n && it.w) : [];
+  e.vistos = e.vistos && typeof e.vistos === "object" ? e.vistos : {};
+  e.ultimo = e.ultimo && typeof e.ultimo === "object" ? e.ultimo : {};
+  e.coletas = e.coletas && typeof e.coletas === "object" ? e.coletas : {};
+  e.resumo = e.resumo && typeof e.resumo === "object" ? e.resumo : null;
+  e.lista = e.lista && typeof e.lista === "object" ? e.lista : null;
+  e.eventos = e.eventos && typeof e.eventos === "object" && !Array.isArray(e.eventos) ? e.eventos : {};
+  return e;
+}
+
+// Tópicos vinham da chave "topicos"; agora ficam dentro do estado4 (uma gravação só).
+async function garantirTopicos(env, estado) {
+  if (estado.topicos && typeof estado.topicos === "object" && !Array.isArray(estado.topicos)) return;
+  const legado = await lerTopicosLegado(env);
+  if (legado === null) throw new Error("registro de tópicos ilegível; ciclo interrompido para evitar duplicações");
+  estado.topicos = legado;
+}
+
+// Fotografia do estado para saber se algo mudou de verdade. Ficam de fora: ultimo e salvoEm
+// (mudam a cada ciclo) e nextTryAt (só controla o intervalo de reenvio).
+function semCheckpoint(e) {
+  const { ultimo, salvoEm, pendentes, ...resto } = e;
+  return JSON.stringify(resto) + "|" + JSON.stringify((pendentes || []).map(it => [it.id, it.tent]));
+}
+function precisaGravar(estado, base) {
+  return semCheckpoint(estado) !== base || Date.now() - Number(estado.salvoEm || 0) > CHECKPOINT_MS;
+}
+
+// Até onde a deduplicação ainda precisa olhar: trades anteriores a esse ponto nunca voltam numa busca futura.
+function corteVistos(estado, w) {
+  if (estado.ultimo[w]) return Number(estado.ultimo[w]) - SOBREPOSICAO_S;
+  const job = estado.coletas[w];
+  return job && job.start ? Number(job.start) : 0;
+}
+
+// Poda antes de cada gravação: vistos antigos saem (exceto os ainda pendentes), tópicos com mais de
+// DIAS_TOPICO dias saem, e vínculos de evento sem tópico também.
+function podarEstado(estado) {
+  const pendentes = new Set(estado.pendentes.map(it => it.id));
+  for (const w of Object.keys(estado.vistos)) {
+    const lista = Array.isArray(estado.vistos[w]) ? estado.vistos[w] : [];
+    const corte = corteVistos(estado, w);
+    const mantidos = lista.filter(k => tsDaChave(k) >= corte || pendentes.has(`${w}|${k}`));
+    if (mantidos.length) estado.vistos[w] = mantidos;
+    else delete estado.vistos[w];
+  }
   const limite = diaBR(Date.now() - DIAS_TOPICO * 86400000);
-  for (const [k, v] of Object.entries(topicos)) if (v && v.dia && v.dia < limite) delete topicos[k];
-  await env.CFG.put(KV_TOPICOS, JSON.stringify(topicos));
+  for (const chave of Object.keys(estado.topicos)) {
+    const t = estado.topicos[chave];
+    if (!t || (t.dia && t.dia < limite)) delete estado.topicos[chave];
+  }
+  for (const cond of Object.keys(estado.eventos)) {
+    if (!estado.topicos[estado.eventos[cond]]) delete estado.eventos[cond];
+  }
 }
 
-// A trava no KV foi removida: gravava e apagava a chave a cada minuto (2 operações/min)
-// e estourava a cota diária do plano gratuito. O cron do Cloudflare já não sobrepõe execuções.
-async function pegarLock(env) { return true; }
-const soltarLock = env => Promise.resolve();
+async function gravar(env, estado) {
+  podarEstado(estado);
+  estado.salvoEm = Date.now();
+  await env.CFG.put(KV_ESTADO, JSON.stringify(estado));
+}
 
-function selecionarCarteiras(carteiras, estado) {
+// Rodízio pelo relógio (não precisa gravar nada): cada minuto desloca a janela de 20 carteiras.
+function selecionarCarteiras(carteiras) {
   if (carteiras.length <= CARTEIRAS_POR_CICLO) return carteiras;
-  const inicio = estado.indiceCarteira % carteiras.length;
-  const selecionadas = [];
-  for (let i = 0; i < CARTEIRAS_POR_CICLO; i++) selecionadas.push(carteiras[(inicio + i) % carteiras.length]);
-  estado.indiceCarteira = (inicio + selecionadas.length) % carteiras.length;
-  return selecionadas;
+  const inicio = (Math.floor(Date.now() / 60000) * CARTEIRAS_POR_CICLO) % carteiras.length;
+  return Array.from({ length: CARTEIRAS_POR_CICLO }, (_, i) => carteiras[(inicio + i) % carteiras.length]);
 }
 
-async function coletarCarteira(c, estado) {
+async function coletarCarteira(c, estado, pendPorW) {
   const w = c.w;
   const agora = agoraS();
   const existentes = new Set(Array.isArray(estado.vistos[w]) ? estado.vistos[w] : []);
-  const prefixoPendente = `${w}|`;
-  for (const item of estado.pendentes) {
-    if (item && item.w === w && typeof item.id === "string" && item.id.startsWith(prefixoPendente)) existentes.add(item.id.slice(prefixoPendente.length));
-  }
+  for (const k of pendPorW.get(w) || []) existentes.add(k);
+
   let job = estado.coletas[w];
   if (!job || typeof job !== "object") {
     const checkpoint = Number(estado.ultimo[w] || 0);
-    job = { start: Math.max(1, checkpoint ? checkpoint - SOBREPOSICAO_S : agora - JANELA_INICIAL_S), end: agora, cursor: null };
+    const inicio = checkpoint
+      ? Math.max(checkpoint - SOBREPOSICAO_S, agora - JANELA_MAXIMA_S)
+      : agora - JANELA_INICIAL_S;
+    job = { start: Math.max(1, inicio), end: agora, cursor: null };
     estado.coletas[w] = job;
   }
   let novos = 0;
@@ -646,32 +695,42 @@ async function coletarCarteira(c, estado) {
       }
     }
   } finally {
-    estado.vistos[w] = [...existentes].slice(-MAX_VISTOS);
+    if (existentes.size) estado.vistos[w] = [...existentes];
+    else delete estado.vistos[w];
     if (!concluido) estado.coletas[w] = job;
   }
-  return { novos, paginas, cursorPendente: !concluido };
+  return { novos, paginas };
 }
-async function coletar(cfg, estado) {
-  const alvos = selecionarCarteiras(cfg.carteiras, estado);
-  let novos = 0, paginas = 0, erros = 0;
+
+async function coletar(cfg, estado, prazo) {
+  const alvos = selecionarCarteiras(cfg.carteiras);
+  const pendPorW = new Map();
+  for (const it of estado.pendentes) {
+    if (!pendPorW.has(it.w)) pendPorW.set(it.w, []);
+    pendPorW.get(it.w).push(it.id.slice(it.w.length + 1));
+  }
+  let novos = 0, paginas = 0, erros = 0, puladas = 0;
   await mapLimit(alvos, CONCORRENCIA, async c => {
+    if (prazo()) { puladas++; return; }
     try {
-      const r = await coletarCarteira(c, estado);
-      novos += r.novos; paginas += r.paginas;
+      const r = await coletarCarteira(c, estado, pendPorW);
+      novos += r.novos;
+      paginas += r.paginas;
     } catch (e) {
       erros++;
       console.warn(`[${c.w.slice(0, 8)}] ${String(e && e.message || e).slice(0, 180)}`);
     }
   });
-  return { novos, paginas, erros, consultadas: alvos.length };
+  return { novos, paginas, erros, puladas, consultadas: alvos.length - puladas };
 }
 
+// Carteira removida: limpa tudo dela (inclusive o checkpoint, para não gerar enxurrada ao readicionar).
 function podarCarteirasRemovidas(estado, cfg) {
   const ativas = new Set(cfg.carteiras.map(c => c.w));
-  const antes = estado.pendentes.length;
   estado.pendentes = estado.pendentes.filter(it => ativas.has(it.w));
-  for (const w of Object.keys(estado.coletas)) if (!ativas.has(w)) delete estado.coletas[w];
-  return antes - estado.pendentes.length;
+  for (const mapa of [estado.coletas, estado.vistos, estado.ultimo]) {
+    for (const w of Object.keys(mapa)) if (!ativas.has(w)) delete mapa[w];
+  }
 }
 
 function sincronizarResumo(estado, cfg) {
@@ -752,11 +811,9 @@ function textoGrupo(env, g, cfg, ev) {
   for (const it of g.itens) {
     const d = descreverAposta(it.n);
     const chave = `${d.classificacao.rotulo} - ${d.escolha}`;
-    
     if (!agregado.has(chave)) {
       agregado.set(chave, { rotulo: d.classificacao.rotulo, escolha: d.escolha, sizeTotal: 0, valorTotal: 0, qtd: 0 });
     }
-    
     const a = agregado.get(chave);
     const valor = Number(it.n.size || 0) * Number(it.n.price || 0);
     a.sizeTotal += Number(it.n.size || 0);
@@ -790,16 +847,13 @@ function agrupar(pendentes) {
 
 function registrarNoResumo(topico, g) {
   if (!topico.resumo) topico.resumo = { msgId: null, mercados: {} };
-  
   for (const it of g.itens) {
     const d = descreverAposta(it.n);
     const chaveM = `${d.classificacao.rotulo.replace(' da partida', '')} - ${d.escolha}`;
     const valor = Number(it.n.size || 0) * Number(it.n.price || 0);
-    
     if (!topico.resumo.mercados[chaveM]) {
       topico.resumo.mercados[chaveM] = { valor: 0, qtd: 0 };
     }
-    
     topico.resumo.mercados[chaveM].valor += valor;
     topico.resumo.mercados[chaveM].qtd += 1;
   }
@@ -841,8 +895,18 @@ async function atualizarPlacarVivo(env, topico) {
   }
 }
 
-async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
+function novoTopico(id, nome, ev) {
+  return {
+    id, nome,
+    inicioMs: (ev && ev.inicioMs) || 0,
+    dia: (ev && ev.data) || diaBR(Date.now()),
+    resumo: { msgId: null, mercados: {} },
+  };
+}
+
+async function enviarGrupo(env, g, cfg, estado, cacheEventos) {
   if (!g || !g.itens || !g.itens.length) return { ok: false, desc: "grupo vazio" };
+  const topicos = estado.topicos;
   const n = g.itens[0].n;
   const ev = await buscarEvento(env, n, cacheEventos);
   const tent = Math.max(...g.itens.map(it => Number(it.tent || 0)));
@@ -852,10 +916,8 @@ async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
   }
 
   let chaveEv = null;
-  if (estado && estado.eventos) {
-    const persistido = estado.eventos[n.cond];
-    if (persistido && topicos[persistido]) chaveEv = persistido;
-  }
+  const persistido = estado.eventos[n.cond];
+  if (persistido && topicos[persistido]) chaveEv = persistido;
   if (!chaveEv) chaveEv = (ev && ev.slug) || n.eventSlug || n.cond;
 
   let topico = topicos[chaveEv];
@@ -865,17 +927,10 @@ async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
     if (!r.ok || !r.result || !r.result.message_thread_id) {
       return { ok: false, status: r.status || 0, desc: "falha ao criar tópico: " + (r.desc || "") };
     }
-    topico = { 
-      id: r.result.message_thread_id, 
-      nome, 
-      inicioMs: (ev && ev.inicioMs) || 0, 
-      dia: (ev && ev.data) || diaBR(Date.now()),
-      resumo: { msgId: null, mercados: {} }
-    };
+    topico = novoTopico(r.result.message_thread_id, nome, ev);
     topicos[chaveEv] = topico;
   }
-
-  if (estado) { if (!estado.eventos) estado.eventos = {}; estado.eventos[n.cond] = chaveEv; }
+  estado.eventos[n.cond] = chaveEv;
 
   const corpo = { chat_id: env.TELEGRAM_CHAT_ID, message_thread_id: topico.id, text: textoGrupo(env, g, cfg, ev), parse_mode: "HTML", disable_web_page_preview: true };
   let r = await enviarComRetentativa(env, "sendMessage", corpo);
@@ -885,13 +940,7 @@ async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
     const nome = nomeTopicoPartida(ev, n);
     const rec = await enviarComRetentativa(env, "createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: nome });
     if (rec.ok && rec.result && rec.result.message_thread_id) {
-      topico = { 
-        id: rec.result.message_thread_id, 
-        nome, 
-        inicioMs: (ev && ev.inicioMs) || 0, 
-        dia: (ev && ev.data) || diaBR(Date.now()),
-        resumo: { msgId: null, mercados: {} }
-      };
+      topico = novoTopico(rec.result.message_thread_id, nome, ev);
       topicos[chaveEv] = topico;
       r = await enviarComRetentativa(env, "sendMessage", { ...corpo, message_thread_id: topico.id });
     }
@@ -902,51 +951,45 @@ async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
     await atualizarPlacarVivo(env, topico);
     return { ok: true, result: r.result, topicoId: topico.id };
   }
-  
   return { ok: false, status: r.status || 0, desc: r.desc || `HTTP ${r.status}`, retryAfter: r.status === 429 ? 5 : 0 };
 }
 
 async function ciclo(env, origem) {
+  const inicio = Date.now();
+  const prazoColeta = () => Date.now() - inicio > PRAZO_COLETA_MS;
+  const prazoEnvio = () => Date.now() - inicio > PRAZO_ENVIO_MS;
   const resultado = { origem, carteiras: 0, consultadas: 0, novos: 0, enviados: 0, falhas: 0, pendentes: 0, erros: [] };
   const faltam = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CFG"].filter(k => !env[k]);
   if (faltam.length) return { ...resultado, erros: ["faltam configurações: " + faltam.join(", ")] };
 
-  let lockObtido = false;
-  let estado = null;
-  let topicos = null;
-  let snapEstado = "";
-  let snapTop = "";
   try {
-    lockObtido = await pegarLock(env);
-    if (!lockObtido) return { ...resultado, ocupado: true };
     const cfg = await lerConfig(env);
     resultado.carteiras = cfg.carteiras.length;
-    estado = await lerEstado(env);
-    snapEstado = semCheckpoint(estado);
+    const estado = await lerEstado(env);
+    const base = semCheckpoint(estado); // fotografia antes de qualquer mudança deste ciclo
+    await garantirTopicos(env, estado);
     podarCarteirasRemovidas(estado, cfg);
     sincronizarResumo(estado, cfg);
-
     await atualizarListaCarteiras(env, estado, cfg);
 
-    topicos = await lerTopicos(env);
-    if (topicos === null) {
-      resultado.erros.push("registro de tópicos ilegível; ciclo interrompido para evitar duplicações");
-      return resultado;
-    }
-    snapTop = JSON.stringify(topicos);
-
     if (estado.pendentes.length < MAX_PENDENTES && cfg.carteiras.length) {
-      const coleta = await coletar(cfg, estado);
+      const coleta = await coletar(cfg, estado, prazoColeta);
       resultado.novos = coleta.novos;
       resultado.consultadas = coleta.consultadas;
       if (coleta.erros) resultado.erros.push(`${coleta.erros} carteira(s) não puderam ser consultadas neste ciclo`);
     }
 
+    // 1ª gravação: o que foi capturado, ANTES de enviar. Se falhar, nada é enviado.
+    if (precisaGravar(estado, base)) await gravar(env, estado);
+
     const cacheEventos = new Map();
     const enviados = new Set();
+    let mudouEnvio = false;
     for (const g of agrupar(estado.pendentes).slice(0, MAX_AVISOS)) {
+      if (prazoEnvio()) break; // o restante fica na fila para o próximo ciclo
+      mudouEnvio = true;
       try {
-        const r = await enviarGrupo(env, g, cfg, topicos, cacheEventos, estado);
+        const r = await enviarGrupo(env, g, cfg, estado, cacheEventos);
         if (r.ok) {
           for (const it of g.itens) enviados.add(it.id);
           registrarAposta(estado, g);
@@ -955,48 +998,60 @@ async function ciclo(env, origem) {
           resultado.falhas++;
           const tentativas = Math.max(...g.itens.map(it => Number(it.tent || 0))) + 1;
           const atraso = Math.max(r.retryAfter || 0, Math.min(300, 5 * (2 ** Math.min(tentativas, 6))));
-          for (const it of g.itens) { it.tent = (it.tent || 0) + 1; it.nextTryAt = Date.now() + atraso * 1000; }
+          for (const it of g.itens) {
+            it.tent = Math.min(MAX_TENTATIVAS, (it.tent || 0) + 1);
+            it.nextTryAt = Date.now() + atraso * 1000;
+          }
           resultado.erros.push(truncar(r.desc || `falha no Telegram (${r.status})`, 220));
         }
       } catch (e) {
         resultado.falhas++;
-        for (const it of g.itens) { it.tent = (it.tent || 0) + 1; it.nextTryAt = Date.now() + Math.min(300, 5 * (2 ** Math.min(it.tent, 6))) * 1000; }
+        for (const it of g.itens) {
+          it.tent = Math.min(MAX_TENTATIVAS, (it.tent || 0) + 1);
+          it.nextTryAt = Date.now() + 60000;
+        }
         resultado.erros.push(truncar(limpar(env, e), 220));
       }
     }
 
-    estado.pendentes = estado.pendentes.filter(it => !enviados.has(it.id));
-    if (estado.resumo && estado.resumo.mudou) await atualizarResumo(env, estado, cfg);
+    if (enviados.size) {
+      estado.pendentes = estado.pendentes.filter(it => !enviados.has(it.id));
+      mudouEnvio = true;
+    }
+    if (estado.resumo && estado.resumo.mudou) {
+      try {
+        if (await atualizarResumo(env, estado, cfg)) mudouEnvio = true;
+      } catch (e) {
+        resultado.erros.push(truncar(limpar(env, e), 200));
+      }
+    }
     resultado.pendentes = estado.pendentes.length;
     resultado.proximoCursor = Object.keys(estado.coletas).length;
+
+    // 2ª gravação: tira da fila o que saiu e guarda tópicos, resumo e tentativas novos.
+    if (mudouEnvio) await gravar(env, estado);
   } catch (e) {
     resultado.erros.push(truncar(limpar(env, e), 300));
-  } finally {
-    try {
-      if (estado && estado.eventos && topicos) {
-        const limite = diaBR(Date.now() - DIAS_TOPICO * 86400000);
-        for (const cond of Object.keys(estado.eventos)) {
-          const t = topicos[estado.eventos[cond]];
-          if (!t || (t.dia && t.dia < limite)) delete estado.eventos[cond];
-        }
-      }
-      // Só grava no KV quando algo mudou de verdade (ou a cada 15 min, para guardar o ponto de leitura).
-      if (estado && (semCheckpoint(estado) !== snapEstado || Date.now() - Number(estado.salvoEm || 0) > CHECKPOINT_MS)) {
-        estado.salvoEm = Date.now();
-        await salvarEstado(env, estado);
-      }
-      if (topicos && JSON.stringify(topicos) !== snapTop) await salvarTopicos(env, topicos);
-    } catch (e) {
-      resultado.erros.push("persistência KV: " + truncar(limpar(env, e), 200));
-    }
-    if (lockObtido) {
-      try { await soltarLock(env); } catch (e) { resultado.erros.push("liberação da trava: " + truncar(limpar(env, e), 120)); }
-    }
   }
   return resultado;
 }
 
 async function salvarCarteirasPayload(env, body) { return salvarCarteiras(env, body && body.carteiras, body && body.base); }
+
+// Após mudar a lista: atualiza a mensagem no Telegram e só grava se o estado mudou.
+async function atualizarListaAposConfig(env) {
+  try {
+    const estado = await lerEstado(env);
+    const base = semCheckpoint(estado);
+    await garantirTopicos(env, estado);
+    const cfg = await lerConfig(env);
+    await atualizarListaCarteiras(env, estado, cfg, true);
+    if (semCheckpoint(estado) !== base) await gravar(env, estado);
+  } catch (e) {
+    console.warn("falha ao atualizar a lista de carteiras: " + limpar(env, e));
+  }
+}
+
 function autorizado(req, env, body) {
   if (!env.CHAVE) return false;
   const auth = req.headers.get("Authorization") || "";
@@ -1034,12 +1089,7 @@ export default {
     try {
       if (path === "/config") {
         const salvos = await salvarCarteirasPayload(env, body);
-        try {
-          const estado = await lerEstado(env);
-          const cfg = await lerConfig(env);
-          await atualizarListaCarteiras(env, estado, cfg, true);
-          await salvarEstado(env, estado);
-        } catch (e) { console.warn("falha ao atualizar lista após /config: " + limpar(env, e)); }
+        await atualizarListaAposConfig(env);
         return jsonResp({ ok: true, ...salvos, versao: VERSAO });
       }
 
@@ -1051,15 +1101,11 @@ export default {
         if (!r.ok) return jsonResp({ ok: false, erro: truncar(limpar(env, r.desc || r.status), 300), versao: VERSAO }, 502);
         return jsonResp({ ok: true, enviado: true, versao: VERSAO });
       }
+
       const out = { ok: true, versao: VERSAO };
       if (body && Array.isArray(body.carteiras)) {
         Object.assign(out, await salvarCarteirasPayload(env, body));
-        try {
-          const estado = await lerEstado(env);
-          const cfg = await lerConfig(env);
-          await atualizarListaCarteiras(env, estado, cfg, true);
-          await salvarEstado(env, estado);
-        } catch (e) { console.warn("falha ao atualizar lista após /notify: " + limpar(env, e)); }
+        await atualizarListaAposConfig(env);
       }
       out.ciclo = await ciclo(env, "manual");
       return jsonResp(out);
