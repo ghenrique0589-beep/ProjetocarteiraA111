@@ -1,5 +1,5 @@
 // Polymarket -> Telegram (e-sports)
-// Module Worker (Cloudflare Workers) - v2.2
+// Module Worker (Cloudflare Workers) - v2.2.1
 // Cron recomendado: * * * * *
 //
 // Secrets / variáveis (Worker Settings > Variables and Secrets):
@@ -45,8 +45,8 @@ const KV_TOPICOS_LEGADO = "topicos";
 const KV_LISTA = "lista_carteiras";
 const KV_TOPICO_ATUALIZACOES = "topico_atualizacoes";
 
-const VERSAO = "2026-10-31-v2.2";
-const VERSAO_CURTA = "v2.2";
+const VERSAO = "2026-11-01-v2.2.1";
+const VERSAO_CURTA = "v2.2.1";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
@@ -268,8 +268,11 @@ function linhaHandicap(n, o) {
   const direto = o.match(/(?:^|[\s(])([+-]\d+(?:[.,]\d+)?)\)?\s*$/);
   if (direto) return { time: o.replace(direto[0], "").trim() || o, valor: Number(direto[1].replace(",", ".")) };
   // 2) pares "Time (±linha)" no título: o lado apostado leva a linha do próprio time; o outro lado, a oposta
-  const pares = [...String(n.titulo || "").matchAll(/([^():]+?)\s*\(\s*([+-]\d+(?:[.,]\d+)?)\s*\)/g)].map(x => ({
-    time: x[1].trim().replace(/^(?:vs\.?|versus)\s+/i, ""),
+  const tit = String(n.titulo || "");
+  let achados = [...tit.matchAll(/([^():]+?)\s*\(\s*([+-]\d+(?:[.,]\d+)?)\s*\)/g)];
+  if (!achados.length) achados = [...tit.matchAll(/([^():+\/]*?[A-Za-z0-9.])\s+([+-]\d+(?:[.,]\d+)?)(?![\d.,])/g)]; // "Time -1.5" sem parênteses
+  const pares = achados.map(x => ({
+    time: x[1].trim().replace(/^(?:vs\.?|versus)\s+/i, "").replace(/^[\/,;|\s]+/, ""),
     valor: Number(x[2].replace(",", ".")),
   }));
   const meu = pares.find(pr => igualTexto(pr.time, o));
@@ -1143,7 +1146,7 @@ function agregarGrupo(env, g) {
     const lado = it.n.side === "SELL" ? "SELL" : "BUY";
     const chave = `${d.rotulo} - ${d.escolha}`;
     const k = `${lado}|${chave}`;
-    if (!mapa.has(k)) mapa.set(k, { lado, chave, rotulo: d.rotulo, escolha: d.escolha, ordem: d.ordem, valor: 0, size: 0 });
+    if (!mapa.has(k)) mapa.set(k, { lado, chave, rotulo: d.rotulo, escolha: d.escolha, ordem: d.ordem, valor: 0, size: 0, conhecido: d.conhecido, titulo: it.n.titulo });
     const a = mapa.get(k);
     a.valor += Number(it.n.size || 0) * Number(it.n.price || 0);
     a.size += Number(it.n.size || 0);
@@ -1160,7 +1163,8 @@ function textoGrupo(env, g, cfg, topico, linhas) {
   const fogo = num(env, "LIMITE_FOGO", 1000);
   const textos = linhas.map(a => {
     const preco = a.size > 0 ? a.valor / a.size : 0;
-    const aposta = `${esc(a.rotulo)}: <b>${esc(a.escolha)}</b> · US$ ${fmtUsd(a.valor)} @ ${fmtPreco(env, preco)}`;
+    const dica = a.conhecido === false ? ` · <i>«${esc(truncar(a.titulo, 80))}»</i>` : "";
+    const aposta = `${esc(a.rotulo)}: <b>${esc(a.escolha)}</b> · US$ ${fmtUsd(a.valor)} @ ${fmtPreco(env, preco)}${dica}`;
     if (a.lado === "SELL") return `🔴 ${quem} vendeu · ${aposta}`;
     const antes = Number(mercados[a.chave] && mercados[a.chave].w && mercados[a.chave].w[g.w]) || 0;
     const sigma = antes > 0 ? ` · Σ ${fmtUsd(antes + a.valor)}` : "";
