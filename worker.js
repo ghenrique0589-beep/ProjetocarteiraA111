@@ -1,5 +1,5 @@
 // Polymarket -> Telegram (e-sports)
-// Module Worker (Cloudflare Workers) - v2.2.1
+// Module Worker (Cloudflare Workers) - v2.3
 // Cron recomendado: * * * * *
 //
 // Secrets / variáveis (Worker Settings > Variables and Secrets):
@@ -15,6 +15,10 @@
 //   CONCORRENCIA           (opcional, padrão 4) carteiras consultadas em paralelo
 //   LIMITE_FOGO            (opcional, padrão 1000) aposta (US$) a partir da qual o aviso ganha 🔥
 //   PRECO_EM_CENTAVOS=1    (opcional) mostra o preço como 59¢ em vez de 59%
+//   RANKING=0              (opcional) desliga o tópico "🏆 Apostas" (ranking do dia; ligado por padrão)
+//   RANKING_MINIMO         (opcional, padrão 10) aposta mínima (US$) para entrar no ranking; 0 conta tudo
+//   RANKING_INTERVALO_S    (opcional, padrão 120) intervalo mínimo entre edições do ranking
+//   TELEGRAM_TOPICO_RANKING (opcional) ID de um tópico já existente para o ranking
 //   MOSTRAR_VERSAO=1       (opcional) acrescenta a versão no fim de cada aviso (útil para comparar Workers)
 //
 // Binding KV (namespace binding name: CFG). Para testar em paralelo, use um namespace SEPARADO:
@@ -45,9 +49,10 @@ const KV_TOPICOS_LEGADO = "topicos";
 const KV_LISTA = "lista_carteiras";
 const KV_TOPICO_ATUALIZACOES = "topico_atualizacoes";
 
-const VERSAO = "2026-11-01-v2.2.1";
-const VERSAO_CURTA = "v2.2.1";
+const VERSAO = "2026-11-01-v2.3";
+const VERSAO_CURTA = "v2.3";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
+const NOME_TOPICO_RANKING = "🏆 Apostas";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
 
@@ -371,7 +376,7 @@ function extrairEvento(ev, cond) {
 // ───────────────────────── infraestrutura ─────────────────────────
 
 // Memória do isolate (não é gravada em lugar nenhum; só reduz leituras e protege contra reenvio).
-const CACHE = { topicoAtualizacoes: 0, listaOk: null, listaFalhaAte: 0, recentes: new Map(), desconhecidos: new Set() };
+const CACHE = { topicoAtualizacoes: 0, listaOk: null, listaFalhaAte: 0, recentes: new Map(), desconhecidos: new Set(), rankingEdicao: {} };
 let SEQ_DRY = 0;
 
 const num = (env, nome, padrao) => {
@@ -718,6 +723,157 @@ async function atualizarResumo(env, estado, cfg) {
   return false;
 }
 
+// ───────────────────────── ranking do dia (tópico "🏆 Apostas") ─────────────────────────
+// Conta pela hora em que a aposta foi feita (fuso de São Paulo), não pela data da partida: aposta de hoje
+// num jogo de amanhã entra no ranking de hoje. Vendas ficam fora do volume e aparecem numa linha à parte.
+
+const PADRAO_RANKING_MINIMO = 10;
+const PADRAO_RANKING_INTERVALO_S = 120;
+const GRACA_RANKING_MS = 3 * 3600 * 1000;   // aposta de ontem vista só depois da meia-noite ainda cai no dia certo
+const MAX_RANKING_PARTIDAS = 80;
+const MAX_RANKING_POSICOES = 120;
+
+const rankingLigado = env => !/^(0|false|nao|não|no|off)$/i.test(String(env.RANKING ?? "1").trim());
+function rankingMinimo(env) {
+  const bruto = env.RANKING_MINIMO;
+  const v = Number(bruto);
+  return bruto !== undefined && String(bruto).trim() !== "" && Number.isFinite(v) && v >= 0 ? v : PADRAO_RANKING_MINIMO;
+}
+const novoRanking = dia => ({ dia, msgId: null, mudou: false, partidas: {}, pos: {}, carteiras: {}, vd: 0 });
+
+// Virou o dia: o ranking de ontem fica guardado por algumas horas só para receber apostas que chegaram atrasadas.
+function rolarRanking(estado) {
+  const hoje = diaBR(Date.now());
+  if (estado.ranking && estado.ranking.dia !== hoje) {
+    estado.rankingAnt = estado.ranking;
+    estado.rankingAnt.ate = Date.now() + GRACA_RANKING_MS;
+    estado.ranking = null;
+  }
+  const a = estado.rankingAnt;
+  if (a && Date.now() > Number(a.ate || 0) && !a.mudou) estado.rankingAnt = null;
+}
+
+function podarMapa(mapa, max) {
+  const chaves = Object.keys(mapa);
+  if (chaves.length <= max) return;
+  chaves.sort((a, b) => Number(mapa[b].v) - Number(mapa[a].v));
+  for (const k of chaves.slice(max)) delete mapa[k];
+}
+
+function registrarNoRanking(env, estado, chave, topico, g, linhas) {
+  const hoje = diaBR(Date.now());
+  // cada execução vale pelo dia em que foi feita; grupos que cruzam a meia-noite são separados por dia
+  const porDia = new Map();
+  for (const it of g.itens) {
+    const ms = Number(it.n.ts || 0) * 1000;
+    const d = ms > 0 ? diaBR(ms) : hoje;
+    if (!porDia.has(d)) porDia.set(d, []);
+    porDia.get(d).push(it);
+  }
+  for (const [dia, itens] of porDia) {
+    let r;
+    if (dia === hoje) r = estado.ranking || (estado.ranking = novoRanking(hoje));
+    else if (estado.rankingAnt && estado.rankingAnt.dia === dia) r = estado.rankingAnt;
+    else continue;
+    somarNoRanking(env, r, chave, topico, g.w, porDia.size === 1 ? linhas : agregarGrupo(env, { ...g, itens }));
+  }
+}
+
+function somarNoRanking(env, r, chave, topico, w, linhas) {
+  const minimo = rankingMinimo(env);
+  for (const a of linhas) {
+    if (!(a.valor >= minimo) || !(a.valor > 0)) continue;
+    if (a.lado === "SELL") { r.vd = r4((r.vd || 0) + a.valor); r.mudou = true; continue; }
+    const p = r.partidas[chave] || (r.partidas[chave] = { n: "", v: 0, c: 0, w: {} });
+    p.n = truncar(topico.nome || "Partida", 80);
+    p.v = r4(p.v + a.valor); p.c += 1; p.w[w] = 1;
+    const c = r.carteiras[w] || (r.carteiras[w] = { v: 0, c: 0 });
+    c.v = r4(c.v + a.valor); c.c += 1;
+    const k = `${w}|${chave}|${a.chave}`;
+    const q = r.pos[k] || (r.pos[k] = { w, r: a.rotulo, e: a.escolha, v: 0, s: 0, m: "" });
+    q.v = r4(q.v + a.valor); q.s = r4(q.s + a.size); q.m = p.n;
+    r.mudou = true;
+  }
+  podarMapa(r.partidas, MAX_RANKING_PARTIDAS);
+  podarMapa(r.pos, MAX_RANKING_POSICOES);
+}
+
+const rotuloDia = iso => {
+  const d = new Date(`${iso}T12:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return diaComAnoBR(iso);
+  const sem = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC", weekday: "short" }).format(d).replace(".", "");
+  return `${sem} ${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
+};
+const plural = (n, um, varios) => `${n} ${n === 1 ? um : varios}`;
+
+function textoRanking(env, r, cfg) {
+  const fogo = num(env, "LIMITE_FOGO", 1000);
+  const partidas = Object.values(r.partidas || {}).sort((a, b) => b.v - a.v);
+  const linhasPartidas = partidas.slice(0, 10).map((p, i) =>
+    `${i + 1}. <b>${esc(truncar(p.n, 60))}</b> · US$ ${fmtUsd(p.v)} · ${plural(p.c, "aposta", "apostas")} · 👤 ${Object.keys(p.w || {}).length}`);
+  const posicoes = Object.values(r.pos || {}).sort((a, b) => b.v - a.v).slice(0, 5).map(q => {
+    const preco = q.s > 0 ? q.v / q.s : 0;
+    return `${q.v >= fogo ? "🔥" : "🟢"} <b>${esc(truncar(nomeCarteira(cfg, q.w), 20))}</b> · ${esc(truncar(q.r, 40))}: <b>${esc(truncar(q.e, 40))}</b> · US$ ${fmtUsd(q.v)} @ ${fmtPreco(env, preco)}\n` +
+      `<i>↳ ${esc(truncar(q.m, 60))}</i>`;
+  });
+  const carteiras = Object.entries(r.carteiras || {}).sort((a, b) => b[1].v - a[1].v).slice(0, 5).map(([w, c], i) =>
+    `${i + 1}. <b>${esc(truncar(nomeCarteira(cfg, w), 20))}</b> · US$ ${fmtUsd(c.v)} · ${plural(c.c, "aposta", "apostas")}`);
+  const total = partidas.reduce((a, p) => a + p.v, 0);
+  const apostas = partidas.reduce((a, p) => a + p.c, 0);
+  const quantas = Object.keys(r.carteiras || {}).length;
+  const secao = (titulo, linhas, limite, resto) =>
+    linhas.length ? `${titulo}\n${juntarBlocos(linhas, "\n", limite, resto)}` : "";
+  const partes = [
+    secao("🎮 <b>Partidas com mais dinheiro</b>", linhasPartidas, 1600, n => `<i>… e mais ${n}</i>`),
+    secao("💎 <b>Maiores apostas</b>", posicoes, 1100, n => `<i>… e mais ${n}</i>`),
+    secao("👤 <b>Carteiras mais ativas</b>", carteiras, 600, n => `<i>… e mais ${n}</i>`),
+  ].filter(Boolean);
+  const vendas = r.vd > 0 ? ` · 🔴 vendeu US$ ${fmtUsd(r.vd)}` : "";
+  return `🏆 <b>APOSTAS · ${rotuloDia(r.dia)}</b>\n\n` +
+    `${partes.join("\n\n") || "<i>aguardando apostas…</i>"}\n\n` +
+    `💰 <b>US$ ${fmtUsd(total)}</b> · ${plural(apostas, "aposta", "apostas")} · 👤 ${quantas}${vendas}\n` +
+    `<i>desde 00h · mín. US$ ${numeroBR(rankingMinimo(env), 0)} · atualizado ${horaBR(Date.now())} · ${VERSAO_CURTA}</i>`;
+}
+
+async function garantirTopicoRanking(env, estado) {
+  const fixo = idTelegram(env, env.TELEGRAM_TOPICO_RANKING);
+  if (fixo) return fixo;
+  const salvo = idTelegram(env, estado.rankingTopico);
+  if (salvo) return salvo;
+  const c = await criarTopico(env, NOME_TOPICO_RANKING);
+  if (!c.ok) { console.warn("ranking: " + limpar(env, c.desc).slice(0, 160)); return 0; }
+  estado.rankingTopico = c.id;
+  return c.id;
+}
+
+// Uma mensagem por dia, editada a cada mudança (no máximo uma edição por RANKING_INTERVALO_S).
+async function atualizarRanking(env, estado, cfg, r) {
+  if (!r || !r.mudou) return false;
+  const intervalo = num(env, "RANKING_INTERVALO_S", PADRAO_RANKING_INTERVALO_S) * 1000;
+  const msgId = idTelegram(env, r.msgId);
+  if (msgId && !env.run.dry && Date.now() - Number(CACHE.rankingEdicao[r.dia] || 0) < intervalo) return false;
+  const texto = textoRanking(env, r, cfg);
+  const base = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, parse_mode: "HTML", disable_web_page_preview: true };
+  if (msgId) {
+    const e = await enviarComRetentativa(env, "editMessageText", { ...base, message_id: msgId });
+    if (e.ok || /not[ _]modified/i.test(e.desc || "")) { r.mudou = false; CACHE.rankingEdicao[r.dia] = Date.now(); return true; }
+    if (/not found|can't be edited|message_id_invalid|message to edit/i.test((e.desc || "").toLowerCase())) r.msgId = null;
+    else { console.warn("ranking: " + limpar(env, e.desc).slice(0, 160)); return false; }
+  }
+  let topico = await garantirTopicoRanking(env, estado);
+  if (!topico) return false;
+  let novo = await enviarComRetentativa(env, "sendMessage", { ...base, message_thread_id: topico });
+  if (!novo.ok && novo.status === 400 && /thread|topic/i.test(novo.desc || "") && !idTelegram(env, env.TELEGRAM_TOPICO_RANKING)) {
+    estado.rankingTopico = 0; // tópico apagado no Telegram: cria outro
+    topico = await garantirTopicoRanking(env, estado);
+    if (!topico) return false;
+    novo = await enviarComRetentativa(env, "sendMessage", { ...base, message_thread_id: topico });
+  }
+  if (novo.ok && novo.result) { r.msgId = novo.result.message_id; r.mudou = false; CACHE.rankingEdicao[r.dia] = Date.now(); return true; }
+  console.warn("ranking não atualizado: " + limpar(env, novo.desc || novo.status).slice(0, 160));
+  return false;
+}
+
 // ───────────────────────── configuração e estado ─────────────────────────
 
 async function lerConfig(env) {
@@ -827,6 +983,10 @@ async function lerEstado(env) {
   e.piso = e.piso && typeof e.piso === "object" ? e.piso : {};
   e.resumo = e.resumo && typeof e.resumo === "object" ? e.resumo : null;
   e.eventos = e.eventos && typeof e.eventos === "object" && !Array.isArray(e.eventos) ? e.eventos : {};
+  const obj = v => (v && typeof v === "object" && !Array.isArray(v) ? v : null);
+  e.ranking = obj(e.ranking);
+  e.rankingAnt = obj(e.rankingAnt);
+  e.rankingTopico = Number.isInteger(Number(e.rankingTopico)) ? Number(e.rankingTopico) : 0;
   return e;
 }
 
@@ -1358,6 +1518,7 @@ async function enviarGrupo(env, g, cfg, estado, cacheEventos) {
   if (r.ok && r.result) {
     topico.ultimoUso = Date.now();
     registrarNoResumo(topico, g, linhas);
+    if (rankingLigado(env)) registrarNoRanking(env, estado, chave, topico, g, linhas);
     await atualizarPlacarVivo(env, topico, cfg);
     return { ok: true };
   }
@@ -1392,6 +1553,7 @@ async function ciclo(env0, origem, opcoes = {}) {
     const base = semCheckpoint(estado); // retrato antes de qualquer mudança desta rodada
     await garantirTopicos(env, estado);
     esquecerEnviados(estado);
+    rolarRanking(estado);
 
     // Sem carteiras na configuração (ex.: chave apagada por engano): não mexe em nada.
     if (cfg.carteiras.length) {
@@ -1489,6 +1651,16 @@ async function ciclo(env0, origem, opcoes = {}) {
         await atualizarResumo(env, estado, cfg);
       } catch (e) {
         resultado.erros.push("resumo: " + truncar(limpar(env, e), 160));
+      }
+    }
+    if (rankingLigado(env)) {
+      for (const r of [estado.ranking, estado.rankingAnt]) {
+        if (!r || !r.mudou || run.sub + 4 > run.limite) continue;
+        try {
+          await atualizarRanking(env, estado, cfg, r);
+        } catch (e) {
+          resultado.erros.push("ranking: " + truncar(limpar(env, e), 160));
+        }
       }
     }
     resultado.pendentes = estado.pendentes.length;
