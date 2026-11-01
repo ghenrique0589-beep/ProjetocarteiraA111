@@ -1,5 +1,5 @@
 // Polymarket -> Telegram (e-sports)
-// Module Worker (Cloudflare Workers) - v2.3
+// Module Worker (Cloudflare Workers) - v2.3.1
 // Cron recomendado: * * * * *
 //
 // Secrets / variáveis (Worker Settings > Variables and Secrets):
@@ -49,8 +49,8 @@ const KV_TOPICOS_LEGADO = "topicos";
 const KV_LISTA = "lista_carteiras";
 const KV_TOPICO_ATUALIZACOES = "topico_atualizacoes";
 
-const VERSAO = "2026-11-01-v2.3";
-const VERSAO_CURTA = "v2.3";
+const VERSAO = "2026-11-01-v2.3.1";
+const VERSAO_CURTA = "v2.3.1";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 const NOME_TOPICO_RANKING = "🏆 Apostas";
 
@@ -784,8 +784,9 @@ function somarNoRanking(env, r, chave, topico, w, linhas) {
   for (const a of linhas) {
     if (!(a.valor >= minimo) || !(a.valor > 0)) continue;
     if (a.lado === "SELL") { r.vd = r4((r.vd || 0) + a.valor); r.mudou = true; continue; }
-    const p = r.partidas[chave] || (r.partidas[chave] = { n: "", v: 0, c: 0, w: {} });
+    const p = r.partidas[chave] || (r.partidas[chave] = { n: "", v: 0, c: 0, w: {}, i: 0 });
     p.n = truncar(topico.nome || "Partida", 80);
+    p.i = Number(topico.inicioMs || 0);
     p.v = r4(p.v + a.valor); p.c += 1; p.w[w] = 1;
     const c = r.carteiras[w] || (r.carteiras[w] = { v: 0, c: 0 });
     c.v = r4(c.v + a.valor); c.c += 1;
@@ -809,11 +810,18 @@ const plural = (n, um, varios) => `${n} ${n === 1 ? um : varios}`;
 function textoRanking(env, r, cfg) {
   const fogo = num(env, "LIMITE_FOGO", 1000);
   const partidas = Object.values(r.partidas || {}).sort((a, b) => b.v - a.v);
-  const linhasPartidas = partidas.slice(0, 10).map((p, i) =>
-    `${i + 1}. <b>${esc(truncar(p.n, 60))}</b> · US$ ${fmtUsd(p.v)} · ${plural(p.c, "aposta", "apostas")} · 👤 ${Object.keys(p.w || {}).length}`);
+  // "Hoje" = jogos do dia do ranking (ou sem horário conhecido, ou já passados); "Próximos dias" = jogos de dias seguintes
+  const futuro = p => p.i > 0 && diaBR(p.i) > r.dia;
+  const top = partidas.slice(0, 10);
+  const cartao = (p, i) =>
+    `${i + 1}. <b>${esc(truncar(p.n, 60))}</b>\n` +
+    `US$ ${fmtUsd(p.v)} · ${plural(p.c, "aposta", "apostas")} · 👤 ${Object.keys(p.w || {}).length}`;
+  const hoje = top.filter(p => !futuro(p)).map(cartao);
+  const proximos = top.filter(futuro).map(cartao);
   const posicoes = Object.values(r.pos || {}).sort((a, b) => b.v - a.v).slice(0, 5).map(q => {
     const preco = q.s > 0 ? q.v / q.s : 0;
-    return `${q.v >= fogo ? "🔥" : "🟢"} <b>${esc(truncar(nomeCarteira(cfg, q.w), 20))}</b> · ${esc(truncar(q.r, 40))}: <b>${esc(truncar(q.e, 40))}</b> · US$ ${fmtUsd(q.v)} @ ${fmtPreco(env, preco)}\n` +
+    return `${q.v >= fogo ? "🔥" : "🟢"} <b>US$ ${fmtUsd(q.v)}</b> @ ${fmtPreco(env, preco)} · ${esc(truncar(nomeCarteira(cfg, q.w), 20))}\n` +
+      `${esc(truncar(q.r, 40))}: <b>${esc(truncar(q.e, 40))}</b>\n` +
       `<i>↳ ${esc(truncar(q.m, 60))}</i>`;
   });
   const carteiras = Object.entries(r.carteiras || {}).sort((a, b) => b[1].v - a[1].v).slice(0, 5).map(([w, c], i) =>
@@ -821,18 +829,19 @@ function textoRanking(env, r, cfg) {
   const total = partidas.reduce((a, p) => a + p.v, 0);
   const apostas = partidas.reduce((a, p) => a + p.c, 0);
   const quantas = Object.keys(r.carteiras || {}).length;
-  const secao = (titulo, linhas, limite, resto) =>
-    linhas.length ? `${titulo}\n${juntarBlocos(linhas, "\n", limite, resto)}` : "";
+  const secao = (titulo, linhas, limite, sep = "\n") =>
+    linhas.length ? `${titulo}\n${juntarBlocos(linhas, sep, limite, n => `<i>… e mais ${n}</i>`)}` : "";
   const partes = [
-    secao("🎮 <b>Partidas com mais dinheiro</b>", linhasPartidas, 1600, n => `<i>… e mais ${n}</i>`),
-    secao("💎 <b>Maiores apostas</b>", posicoes, 1100, n => `<i>… e mais ${n}</i>`),
-    secao("👤 <b>Carteiras mais ativas</b>", carteiras, 600, n => `<i>… e mais ${n}</i>`),
+    secao("🎮 <b>HOJE</b>", hoje, 1000, "\n\n"),
+    secao("📅 <b>PRÓXIMOS DIAS</b>", proximos, 800, "\n\n"),
+    secao("💎 <b>MAIORES APOSTAS</b>", posicoes, 1100, "\n\n"),
+    secao("👤 <b>CARTEIRAS</b>", carteiras, 600),
   ].filter(Boolean);
   const vendas = r.vd > 0 ? ` · 🔴 vendeu US$ ${fmtUsd(r.vd)}` : "";
-  return `🏆 <b>APOSTAS · ${rotuloDia(r.dia)}</b>\n\n` +
+  return `🏆 <b>APOSTAS · ${rotuloDia(r.dia)}</b>\n` +
+    `💰 <b>US$ ${fmtUsd(total)}</b> · ${plural(apostas, "aposta", "apostas")} · 👤 ${quantas}${vendas}\n\n` +
     `${partes.join("\n\n") || "<i>aguardando apostas…</i>"}\n\n` +
-    `💰 <b>US$ ${fmtUsd(total)}</b> · ${plural(apostas, "aposta", "apostas")} · 👤 ${quantas}${vendas}\n` +
-    `<i>desde 00h · mín. US$ ${numeroBR(rankingMinimo(env), 0)} · atualizado ${horaBR(Date.now())} · ${VERSAO_CURTA}</i>`;
+    `<i>atualizado ${horaBR(Date.now())} · ${VERSAO_CURTA} · mín. US$ ${numeroBR(rankingMinimo(env), 0)}</i>`;
 }
 
 async function garantirTopicoRanking(env, estado) {
